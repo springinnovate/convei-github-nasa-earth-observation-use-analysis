@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nasa-eo-sourcegraph-search"
+version = "0.1.0"
+description = "Trace one query through Sourcegraph's streaming search API"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Spring Innovate" },
+]
+dependencies = []
+
+[project.scripts]
+sourcegraph-search = "nasa_eo_search.sourcegraph:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
