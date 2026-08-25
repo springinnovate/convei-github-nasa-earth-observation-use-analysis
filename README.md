@@ -6,7 +6,7 @@ writes the matching code records as JSON Lines.
 
 ## Install
 
-Python 3.10 or newer is required. The client has no runtime dependencies.
+Python 3.10 or newer is required. Certifi is the only runtime dependency.
 
 ```console
 python -m pip install -e .

@@ -12,17 +12,21 @@ import certifi
 from nasa_eo_search.sourcegraph import (
     ServerSentEvent,
     SourcegraphProtocolError,
-    build_request,
-    build_ssl_context,
-    decode_event,
-    emit_results,
-    iter_sse,
+    build_sourcegraph_search_request,
+    build_tls_context,
+    decode_sourcegraph_event_payload,
+    parse_server_sent_events,
+    write_search_results,
 )
 
 
 class ServerSentEventTests(unittest.TestCase):
+    """Verify decoding of Sourcegraph server-sent event framing."""
+
     def test_parses_multiple_events_comments_and_multiline_data(self) -> None:
-        stream = [
+        """Parse event names, comments, and payloads split across data fields."""
+
+        response_lines = [
             b": heartbeat\n",
             b"event: matches\n",
             b'data: [{"type":"content",\n',
@@ -33,10 +37,10 @@ class ServerSentEventTests(unittest.TestCase):
             b"\n",
         ]
 
-        events = list(iter_sse(stream))
+        parsed_events = list(parse_server_sent_events(response_lines))
 
         self.assertEqual(
-            events,
+            parsed_events,
             [
                 ServerSentEvent(
                     "matches", '[{"type":"content",\n"path":"demo.py"}]'
@@ -46,52 +50,86 @@ class ServerSentEventTests(unittest.TestCase):
         )
 
     def test_emits_pending_event_at_end_of_stream(self) -> None:
-        events = list(iter_sse(["event: done\n", "data: {}\n"]))
-        self.assertEqual(events, [ServerSentEvent("done", "{}")])
+        """Emit a complete final event when the response omits a blank line."""
+
+        parsed_events = list(
+            parse_server_sent_events(["event: done\n", "data: {}\n"])
+        )
+        self.assertEqual(parsed_events, [ServerSentEvent("done", "{}")])
 
     def test_rejects_invalid_json(self) -> None:
+        """Raise a protocol error when an event does not contain valid JSON."""
+
         with self.assertRaises(SourcegraphProtocolError):
-            decode_event(ServerSentEvent("matches", "not-json"))
+            decode_sourcegraph_event_payload(
+                ServerSentEvent("matches", "not-json")
+            )
 
 
 class RequestTests(unittest.TestCase):
+    """Verify construction of Sourcegraph HTTP requests and TLS contexts."""
+
     def test_builds_one_v3_stream_request_with_optional_token(self) -> None:
-        request = build_request(
+        """Build one authenticated V3 event-stream request for the query."""
+
+        search_request = build_sourcegraph_search_request(
             "https://sourcegraph.example/.api/search/stream",
             "earthdata.nasa.gov count:10",
             "secret",
         )
 
-        self.assertIn("q=earthdata.nasa.gov+count%3A10", request.full_url)
-        self.assertIn("v=V3", request.full_url)
-        self.assertEqual(request.get_header("Accept"), "text/event-stream")
-        self.assertEqual(request.get_header("Authorization"), "token secret")
+        self.assertIn("q=earthdata.nasa.gov+count%3A10", search_request.full_url)
+        self.assertIn("v=V3", search_request.full_url)
+        self.assertEqual(search_request.get_header("Accept"), "text/event-stream")
+        self.assertEqual(
+            search_request.get_header("Authorization"), "token secret"
+        )
 
     @patch("nasa_eo_search.sourcegraph.ssl.create_default_context")
-    def test_tls_context_uses_certifi_instead_of_windows_store(self, create_context) -> None:
-        expected_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        create_context.return_value = expected_context
+    def test_tls_context_uses_certifi_instead_of_windows_store(
+        self, create_default_context_mock
+    ) -> None:
+        """Use Certifi instead of the Windows certificate store by default.
+
+        Args:
+            create_default_context_mock: Mocked TLS-context factory.
+        """
+
+        expected_tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        create_default_context_mock.return_value = expected_tls_context
 
         with patch.dict(os.environ, {}, clear=True):
-            context = build_ssl_context(None)
+            tls_context = build_tls_context(None)
 
-        self.assertIs(context, expected_context)
-        create_context.assert_called_once_with(cafile=certifi.where())
+        self.assertIs(tls_context, expected_tls_context)
+        create_default_context_mock.assert_called_once_with(cafile=certifi.where())
 
     @patch("nasa_eo_search.sourcegraph.ssl.create_default_context")
-    def test_tls_context_honors_explicit_ca_bundle(self, create_context) -> None:
-        expected_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        create_context.return_value = expected_context
+    def test_tls_context_honors_explicit_ca_bundle(
+        self, create_default_context_mock
+    ) -> None:
+        """Prefer an explicitly supplied CA bundle over the Certifi default.
 
-        context = build_ssl_context("company-ca.pem")
+        Args:
+            create_default_context_mock: Mocked TLS-context factory.
+        """
 
-        self.assertIs(context, expected_context)
-        create_context.assert_called_once_with(cafile="company-ca.pem")
+        expected_tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        create_default_context_mock.return_value = expected_tls_context
+
+        tls_context = build_tls_context("company-ca.pem")
+
+        self.assertIs(tls_context, expected_tls_context)
+        create_default_context_mock.assert_called_once_with(cafile="company-ca.pem")
 
 
 class OutputTests(unittest.TestCase):
+    """Verify JSON Lines output and diagnostic summaries."""
+
     def test_flattens_matches_as_json_lines_and_summarizes_progress(self) -> None:
-        events = [
+        """Flatten matches as JSON Lines and summarize final progress counts."""
+
+        search_events = [
             ServerSentEvent(
                 "matches",
                 json.dumps(
@@ -116,32 +154,41 @@ class OutputTests(unittest.TestCase):
             ),
             ServerSentEvent("done", "{}"),
         ]
-        output = StringIO()
-        diagnostics = StringIO()
+        results_output = StringIO()
+        diagnostics_output = StringIO()
 
-        count = emit_results(events, "earthdata", output, diagnostics)
-
-        self.assertEqual(count, 1)
-        record = json.loads(output.getvalue())
-        self.assertEqual(record["query"], "earthdata")
-        self.assertEqual(record["match"]["path"], "search\u202fresult.py")
-        self.assertIn("\\u202f", output.getvalue())
-        self.assertIn("matches=1", diagnostics.getvalue())
-        self.assertIn("repositories=1", diagnostics.getvalue())
-
-    def test_raw_mode_writes_non_match_events(self) -> None:
-        output = StringIO()
-        diagnostics = StringIO()
-
-        emit_results(
-            [ServerSentEvent("done", "{}")],
+        written_record_count = write_search_results(
+            search_events,
             "earthdata",
-            output,
-            diagnostics,
-            raw_events=True,
+            results_output,
+            diagnostics_output,
         )
 
-        self.assertEqual(json.loads(output.getvalue()), {"event": "done", "data": {}})
+        self.assertEqual(written_record_count, 1)
+        output_record = json.loads(results_output.getvalue())
+        self.assertEqual(output_record["query"], "earthdata")
+        self.assertEqual(output_record["match"]["path"], "search\u202fresult.py")
+        self.assertIn("\\u202f", results_output.getvalue())
+        self.assertIn("matches=1", diagnostics_output.getvalue())
+        self.assertIn("repositories=1", diagnostics_output.getvalue())
+
+    def test_raw_mode_writes_non_match_events(self) -> None:
+        """Write non-match events when raw event output is requested."""
+
+        results_output = StringIO()
+        diagnostics_output = StringIO()
+
+        write_search_results(
+            [ServerSentEvent("done", "{}")],
+            "earthdata",
+            results_output,
+            diagnostics_output,
+            write_raw_events=True,
+        )
+
+        self.assertEqual(
+            json.loads(results_output.getvalue()), {"event": "done", "data": {}}
+        )
 
 
 if __name__ == "__main__":
