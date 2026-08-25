@@ -7,12 +7,15 @@ from dataclasses import dataclass
 import json
 import os
 import socket
+import ssl
 import sys
 from collections.abc import Iterable, Iterator
 from typing import Any, TextIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+import certifi
 
 
 DEFAULT_ENDPOINT = "https://sourcegraph.com/.api/search/stream"
@@ -101,14 +104,33 @@ def build_request(endpoint: str, query: str, token: str | None) -> Request:
     return Request(url, headers=headers, method="GET")
 
 
+def build_ssl_context(ca_bundle: str | None) -> ssl.SSLContext:
+    """Create a TLS context without reading the platform certificate store."""
+
+    bundle = ca_bundle or os.environ.get("SSL_CERT_FILE") or certifi.where()
+    try:
+        return ssl.create_default_context(cafile=bundle)
+    except (OSError, ssl.SSLError) as error:
+        raise SourcegraphError(
+            f"Could not load the TLS CA bundle {bundle!r}: {error}"
+        ) from error
+
+
 def stream_search(
-    endpoint: str, query: str, token: str | None, timeout: float
+    endpoint: str,
+    query: str,
+    token: str | None,
+    timeout: float,
+    ca_bundle: str | None = None,
 ) -> Iterator[ServerSentEvent]:
     """Make one request and yield events as Sourcegraph sends them."""
 
     request = build_request(endpoint, query, token)
+    context = build_ssl_context(ca_bundle)
     try:
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310
+        with urlopen(  # noqa: S310
+            request, timeout=timeout, context=context
+        ) as response:
             content_type = response.headers.get_content_type()
             if content_type != "text/event-stream":
                 raise SourcegraphProtocolError(
@@ -125,6 +147,8 @@ def stream_search(
     except (URLError, TimeoutError, socket.timeout) as error:
         reason = getattr(error, "reason", error)
         raise SourcegraphError(f"Could not reach Sourcegraph: {reason}") from error
+    except ssl.SSLError as error:
+        raise SourcegraphError(f"Sourcegraph TLS connection failed: {error}") from error
 
 
 def emit_results(
@@ -216,6 +240,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="connection/read timeout in seconds (default: 60)",
     )
     parser.add_argument(
+        "--ca-bundle",
+        metavar="PATH",
+        help="PEM CA bundle (default: SSL_CERT_FILE or Certifi)",
+    )
+    parser.add_argument(
         "--token-env",
         default="SOURCEGRAPH_TOKEN",
         metavar="NAME",
@@ -242,7 +271,13 @@ def main(argv: list[str] | None = None) -> int:
 
     token = os.environ.get(args.token_env)
     try:
-        events = stream_search(args.endpoint, args.query, token, args.timeout)
+        events = stream_search(
+            args.endpoint,
+            args.query,
+            token,
+            args.timeout,
+            ca_bundle=args.ca_bundle,
+        )
         emit_results(
             events,
             args.query,

@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from io import StringIO
 import json
+import os
+import ssl
 import unittest
+from unittest.mock import patch
+
+import certifi
 
 from nasa_eo_search.sourcegraph import (
     ServerSentEvent,
     SourcegraphProtocolError,
     build_request,
+    build_ssl_context,
     decode_event,
     emit_results,
     iter_sse,
@@ -60,6 +66,27 @@ class RequestTests(unittest.TestCase):
         self.assertIn("v=V3", request.full_url)
         self.assertEqual(request.get_header("Accept"), "text/event-stream")
         self.assertEqual(request.get_header("Authorization"), "token secret")
+
+    @patch("nasa_eo_search.sourcegraph.ssl.create_default_context")
+    def test_tls_context_uses_certifi_instead_of_windows_store(self, create_context) -> None:
+        expected_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        create_context.return_value = expected_context
+
+        with patch.dict(os.environ, {}, clear=True):
+            context = build_ssl_context(None)
+
+        self.assertIs(context, expected_context)
+        create_context.assert_called_once_with(cafile=certifi.where())
+
+    @patch("nasa_eo_search.sourcegraph.ssl.create_default_context")
+    def test_tls_context_honors_explicit_ca_bundle(self, create_context) -> None:
+        expected_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        create_context.return_value = expected_context
+
+        context = build_ssl_context("company-ca.pem")
+
+        self.assertIs(context, expected_context)
+        create_context.assert_called_once_with(cafile="company-ca.pem")
 
 
 class OutputTests(unittest.TestCase):

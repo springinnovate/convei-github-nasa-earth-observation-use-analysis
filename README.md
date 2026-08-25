@@ -66,6 +66,21 @@ put it in `SOURCEGRAPH_TOKEN`; it is deliberately not accepted as a command-line
 argument so it does not appear in shell history. A self-hosted endpoint can be
 selected with `--endpoint`.
 
+### TLS certificates
+
+The client uses Certifi's curated CA bundle instead of the Windows certificate
+store. This avoids certificate-store parsing failures seen with some Conda
+Python installations on Windows.
+
+If a network proxy requires a private CA, supply its PEM bundle explicitly:
+
+```console
+sourcegraph-search --ca-bundle company-ca.pem "earthdata.nasa.gov count:10"
+```
+
+The `SSL_CERT_FILE` environment variable is also honored when `--ca-bundle` is
+not supplied.
+
 ## Test
 
 ```console

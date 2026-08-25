@@ -12,7 +12,9 @@ license = { file = "LICENSE" }
 authors = [
   { name = "Spring Innovate" },
 ]
-dependencies = []
+dependencies = [
+  "certifi",
+]
 
 [project.scripts]
 sourcegraph-search = "nasa_eo_search.sourcegraph:main"
