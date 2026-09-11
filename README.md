@@ -20,7 +20,49 @@ NASA's [Common Metadata Repository](https://www.earthdata.nasa.gov/about/esdis/e
 
 [Sourcegraph Public Code Search](https://sourcegraph.com/search) provides keyword, regular expression, and filename searches across its index of public GitHub repositories. It will be our initial code search provider for Phase 2. Because the product and search signature catalog will be provider independent, we will be able to use additional search providers as the work develops.
 
-## Try the first Phase 1 result
+## Try finding a NASA data reference in public code
+
+Run this to search public GitHub repository contents for a product name or phrase
+and stop at the first matching file:
+
+```console
+python -m pip install -e .
+nasa-repo-preview ATL03
+```
+
+The command contacts Sourcegraph's public code search and prints a repository
+link, star count when available, file path, language, commit, and matching code
+lines. It closes the connection as soon as the first file match arrives. The
+first match is whichever arrives first; it is not ranked as the best example.
+An immediate status message and subsequent search progress appear on screen.
+
+Other examples:
+
+```console
+nasa-repo-preview "earthdata.nasa.gov"
+nasa-repo-preview ATL03 --all-hosts
+nasa-repo-preview ATL03 > first-repository.json
+```
+
+`--all-hosts` includes other public code hosts indexed by Sourcegraph. Searches
+use a literal phrase, a one-result limit, a 15-second server search timeout,
+and a 20-second socket timeout. These timeouts are not a strict wall-clock
+deadline. You can interrupt with Ctrl+C. JSON results go to stdout; status and
+search warnings go to stderr. Exit codes are 0 for a match, 1 for an error,
+2 for invalid arguments, and 3 if no match is returned.
+
+This tests the repository-discovery step directly. It does not contact NASA's
+catalog. The result is evidence to inspect: a mention alone does not establish
+use. Coverage is Sourcegraph's public index, with forks and archived repositories
+excluded by default. No returned match does not prove that no repositories use
+the product. Search limits and exclusions reported by the service are displayed.
+
+The existing `sourcegraph-search` command accepts a full Sourcegraph query for
+larger searches. The optional catalog lookup below serves a different purpose:
+finding names to search for. If a command is missing from your PATH, use
+`python -m nasa_eo_search.repo_preview ATL03` in the installed environment.
+
+## Optional: preview a product in NASA's catalog
 
 The `nasa-product-preview` command asks NASA CMR for one EOSDIS collection,
 prints its name, version, provider, collection ID, and candidate code search
