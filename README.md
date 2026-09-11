@@ -19,3 +19,78 @@ We will present the Phase 2 evidence base as a catalog of GitHub repositories th
 NASA's [Common Metadata Repository](https://www.earthdata.nasa.gov/about/esdis/eosdis/cmr) is a searchable catalog of Earth science datasets. It includes NASA Earth observation products, as well as data outside our scope. In Phase 1, we will use it as the starting point for identifying relevant products and deriving their search terms and patterns.
 
 [Sourcegraph Public Code Search](https://sourcegraph.com/search) provides keyword, regular expression, and filename searches across its index of public GitHub repositories. It will be our initial code search provider for Phase 2. Because the product and search signature catalog will be provider independent, we will be able to use additional search providers as the work develops.
+
+## Try the first Phase 1 result
+
+The `nasa-product-preview` command asks NASA CMR for one EOSDIS collection,
+prints its name, version, provider, collection ID, and candidate code search
+terms, then exits. This gives us a small working example to inspect before we
+build the larger catalog.
+
+Install or update the commands with Python 3.10 or newer (run this again if you
+installed the earlier Sourcegraph tool):
+
+```console
+python -m pip install -e .
+nasa-product-preview
+```
+
+To try a recognizable product, use its short name:
+
+```console
+nasa-product-preview --short-name ATL03
+```
+
+For example, an ATL03 result can include `ATL03`, a collection entry identifier
+such as `ATL03_007`, and a CMR concept ID. Each candidate term identifies the
+metadata field it came from and is marked unreviewed. The output also includes
+the request URL and retrieval time. Versions and CMR's first result can change;
+this command does not select or promise the newest version.
+
+The command prints an immediate status message, requests `page_size=1` through
+the [CMR Search API](https://cmr.earthdata.nasa.gov/search/site/docs/search/api.html),
+and stops after that response. It needs no NASA account or token. It downloads
+collection metadata only. The `gov.nasa.eosdis` tag selects an initial catalog
+scope; whether each collection fits our NASA product definition still needs
+review. No pagination, granule downloads, or GitHub searches run automatically.
+
+Success demonstrates that we can reach CMR and extract traceable candidate terms.
+It does not yet tell us whether those terms find relevant GitHub repositories,
+whether a mention represents use, or how complete the product catalog will be.
+Filename conventions and additional aliases will need further evidence.
+
+Output is formatted JSON, which is readable on screen and can also be saved:
+
+```console
+nasa-product-preview --short-name ATL03 > first-product.json
+```
+
+Status messages go to standard error so the saved JSON contains only the result.
+Exit codes are 0 for a result, 1 for an error, 2 for invalid arguments, and 3 for
+no matching collection. A missing match is reported explicitly. The default
+connection/read timeout is 20 seconds; `--timeout 10` changes it. This is a
+socket timeout, not a guaranteed total runtime. Ctrl+C interrupts the request.
+TLS uses Certifi to support Windows/Conda certificate handling; `--ca-bundle PATH`
+or `SSL_CERT_FILE` can supply a private certificate authority bundle if required.
+
+If the command is not on your PATH, use the same Python environment directly:
+
+```console
+python -m nasa_eo_search.cmr --short-name ATL03
+```
+
+After inspecting the returned terms, a separate manual Phase 2 check can use the
+existing search command:
+
+```console
+sourcegraph-search --trace "repo:^github.com/ ATL03 count:10 timeout:15s"
+```
+
+This searches Sourcegraph's indexed GitHub repositories and returns candidate
+references for inspection. It is not a measure of complete GitHub coverage.
+
+Run the offline test suite with:
+
+```console
+python -m unittest discover -s tests -v
+```
