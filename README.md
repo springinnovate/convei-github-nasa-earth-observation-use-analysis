@@ -20,7 +20,58 @@ NASA's [Common Metadata Repository](https://www.earthdata.nasa.gov/about/esdis/e
 
 [Sourcegraph Public Code Search](https://sourcegraph.com/search) provides keyword, regular expression, and filename searches across its index of public GitHub repositories. It will be our initial code search provider for Phase 2. Because the product and search signature catalog will be provider independent, we will be able to use additional search providers as the work develops.
 
-## Try finding a NASA data reference in public code
+## Collect all returned references for a product
+
+Use `nasa-repo-search` to collect a full search response instead of stopping
+after one file:
+
+```console
+python -m pip install -e .
+nasa-repo-search ATL03 --output atl03-search
+```
+
+The output directory must be new, so existing results cannot be overwritten.
+It contains:
+
+- `matches.jsonl`: every returned match, saved as it arrives, with the query and
+  original Sourcegraph evidence (repository, file, revision, and matching lines).
+- `events.jsonl`: server progress, warnings, and completion events.
+- `summary.json`: run times, saved-record and distinct-repository counts,
+  the query, search scope, and completion status.
+
+This command requests `count:all`, includes forks and archived repositories,
+and keeps collecting until the server ends the stream. It uses the same product
+boundaries as the preview, so `ATL03` does not match `MATL03`. Add `--all-hosts`
+to search other public code hosts in Sourcegraph's index as well as GitHub.
+Counts on screen describe saved results, not repositories searched. A repository
+can have many matches and a file can appear in more than one streamed record.
+
+The completion status matters:
+
+- `finished_no_reported_limits` (exit 0): received both final progress and the
+  end-of-stream event, with no reported skips or alerts. This applies only to
+  the queried index and its search scope.
+- `incomplete` (exit 4): the server reported exclusions/limits/alerts or failed
+  to provide both completion signals. Inspect the recorded warnings. They are
+  retained conservatively even if a later progress event omits them.
+- `failed` (exit 1) or `interrupted` (exit 130): retained results are partial.
+- `running`: no final summary was written, such as after a forced process stop.
+
+`count:all` removes our result cap; it cannot remove Sourcegraph's server limits
+or find code absent from its index. The server search timeout is 60 seconds,
+with a 65-second socket timeout; neither guarantees a total wall-clock deadline.
+The command does not yet split incomplete searches or resume them automatically.
+Reruns use a new directory and may return duplicates. Partial saved results are
+not evidence that all repositories have been searched.
+
+For the research goal of *all* matching public repositories, this is the
+collection step. Broader searches may need separate repository-scoped queries
+when limits are reported, plus deduplication and a recorded inventory of which
+query scopes finished. Even then, establishing GitHub-wide coverage requires
+an independently enumerated repository inventory and searching gaps outside
+Sourcegraph. The public index alone cannot certify that census.
+
+## Try finding one NASA data reference in public code
 
 Run this to search public GitHub repository contents for a product name or phrase
 and stop at the first matching file:

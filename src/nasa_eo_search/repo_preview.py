@@ -22,18 +22,22 @@ from nasa_eo_search.sourcegraph import (
 )
 
 
-def build_preview_query(search_phrase: str, all_hosts: bool) -> str:
-    """Build a delimited public-content search limited to one result.
+def build_repository_query(
+    search_phrase: str, all_hosts: bool, *, collect_all: bool = False,
+) -> str:
+    """Build a delimited public-content search for a preview or full collection.
 
     Args:
         search_phrase: Literal product identifier or phrase to find in contents.
             Adjacent ASCII letters or digits prevent a match. Underscores and
             punctuation count as delimiters, allowing product filenames.
         all_hosts: Include every public code host indexed by Sourcegraph.
+        collect_all: Request all results, including forks and archived repos.
 
     Returns:
-        A case-insensitive Sourcegraph regular expression query with a 15-second
-        server search timeout. User text is escaped, not interpreted as regex.
+        A case-insensitive Sourcegraph regular expression query. Full collection
+        uses a 60-second server timeout; previews use 15 seconds. User text is
+        escaped, not interpreted as regex.
     """
 
     # RE2 does not support lookbehind. Consume delimiters on either side instead.
@@ -46,9 +50,13 @@ def build_preview_query(search_phrase: str, all_hosts: bool) -> str:
     )
     bounded_pattern = r"(^|[^A-Za-z0-9])" + escaped_phrase + r"($|[^A-Za-z0-9])"
     host_filter = "" if all_hosts else r"repo:^github\.com/ "
+    search_limits = (
+        "fork:yes archived:yes count:all timeout:60s"
+        if collect_all else "count:1 timeout:15s"
+    )
     return (
         f'{host_filter}visibility:public type:file patternType:regexp case:no '
-        f'content:{bounded_pattern} count:1 timeout:15s'
+        f'content:{bounded_pattern} {search_limits}'
     )
 
 
@@ -164,7 +172,7 @@ def main(argument_values: list[str] | None = None) -> int:
     search_phrase = parsed_arguments.phrase.strip()
     if not search_phrase or any(ord(character) < 32 for character in search_phrase):
         argument_parser.error("phrase must be nonempty and contain no control characters")
-    search_query = build_preview_query(search_phrase, parsed_arguments.all_hosts)
+    search_query = build_repository_query(search_phrase, parsed_arguments.all_hosts)
     print(
         f"Searching public repositories via Sourcegraph for {search_phrase!r}...",
         file=sys.stderr, flush=True,

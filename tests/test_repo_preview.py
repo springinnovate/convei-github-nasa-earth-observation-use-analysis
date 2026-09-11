@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from nasa_eo_search.repo_preview import (
-    build_preview_query, first_content_match, main, summarize_repository_match,
+    build_repository_query, first_content_match, main, summarize_repository_match,
 )
 from nasa_eo_search.sourcegraph import ServerSentEvent, SourcegraphProtocolError
 
@@ -28,7 +28,7 @@ class RepositoryPreviewTests(unittest.TestCase):
         """Escape regex and query syntax in the user-supplied phrase."""
 
         search_phrase = 'ATL03 "quoted" \\ repo:elsewhere'
-        search_query = build_preview_query(search_phrase, False)
+        search_query = build_repository_query(search_phrase, False)
         decoded_pattern = search_query.split('content:', 1)[1].rsplit(' count:', 1)[0]
         self.assertNotIn(' ', decoded_pattern)
         self.assertNotIn('"', decoded_pattern)
@@ -43,12 +43,12 @@ class RepositoryPreviewTests(unittest.TestCase):
         self.assertIn(r'repo:^github\.com/', search_query)
         self.assertIn('visibility:public', search_query)
         self.assertIn('count:1 timeout:15s', search_query)
-        self.assertNotIn('repo:', build_preview_query('ATL03', True))
+        self.assertNotIn('repo:', build_repository_query('ATL03', True))
 
     def test_product_boundaries_reject_substrings_and_keep_filenames(self) -> None:
         """Reject MATL03 and suffix collisions while retaining product tokens."""
 
-        search_query = build_preview_query("ATL03", False)
+        search_query = build_repository_query("ATL03", False)
         encoded_pattern = search_query.split('content:', 1)[1].rsplit(' count:', 1)[0]
         search_pattern = re.compile(encoded_pattern, re.IGNORECASE)
         for file_contents in (
@@ -66,7 +66,7 @@ class RepositoryPreviewTests(unittest.TestCase):
     def test_domain_punctuation_remains_literal(self) -> None:
         """Do not allow regex dots to turn a domain into wildcard matches."""
 
-        search_query = build_preview_query("earthdata.nasa.gov", False)
+        search_query = build_repository_query("earthdata.nasa.gov", False)
         encoded_pattern = search_query.split('content:', 1)[1].rsplit(' count:', 1)[0]
         search_pattern = re.compile(encoded_pattern, re.IGNORECASE)
         self.assertIsNotNone(search_pattern.search("https://earthdata.nasa.gov/"))
