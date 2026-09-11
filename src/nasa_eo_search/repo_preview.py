@@ -1,4 +1,4 @@
-"""Find the first public repository reference to a literal data product term."""
+"""Find the first public repository reference to a delimited data product term."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 import json
 import os
+import re
 import sys
 from typing import Any, Iterable, TextIO
 from urllib.parse import quote, urlencode
@@ -22,21 +23,32 @@ from nasa_eo_search.sourcegraph import (
 
 
 def build_preview_query(search_phrase: str, all_hosts: bool) -> str:
-    """Build a literal public-content search limited to one result.
+    """Build a delimited public-content search limited to one result.
 
     Args:
-        search_phrase: Product identifier or phrase to find in file contents.
+        search_phrase: Literal product identifier or phrase to find in contents.
+            Adjacent ASCII letters or digits prevent a match. Underscores and
+            punctuation count as delimiters, allowing product filenames.
         all_hosts: Include every public code host indexed by Sourcegraph.
 
     Returns:
-        A Sourcegraph query with a 15-second server search timeout.
+        A case-insensitive Sourcegraph regular expression query with a 15-second
+        server search timeout. User text is escaped, not interpreted as regex.
     """
 
-    quoted_phrase = json.dumps(search_phrase, ensure_ascii=False)
+    # RE2 does not support lookbehind. Consume delimiters on either side instead.
+    # Quoting content makes Sourcegraph treat the regex as literal text. Encode
+    # whitespace and quotes so the pattern remains one unquoted query parameter.
+    escaped_phrase = "".join(
+        rf"\x{{{ord(character):x}}}" if character.isspace() or character in "\"'"
+        else re.escape(character)
+        for character in search_phrase
+    )
+    bounded_pattern = r"(^|[^A-Za-z0-9])" + escaped_phrase + r"($|[^A-Za-z0-9])"
     host_filter = "" if all_hosts else r"repo:^github\.com/ "
     return (
-        f'{host_filter}visibility:public type:file patternType:literal '
-        f'content:{quoted_phrase} count:1 timeout:15s'
+        f'{host_filter}visibility:public type:file patternType:regexp case:no '
+        f'content:{bounded_pattern} count:1 timeout:15s'
     )
 
 
@@ -139,7 +151,10 @@ def main(argument_values: list[str] | None = None) -> int:
         prog="nasa-repo-preview",
         description="Find one public repository reference to a data product or phrase.",
     )
-    argument_parser.add_argument("phrase", help="literal term, e.g. ATL03 or earthdata.nasa.gov")
+    argument_parser.add_argument(
+        "phrase",
+        help="delimited literal term, e.g. ATL03; excludes substrings like MATL03",
+    )
     argument_parser.add_argument(
         "--all-hosts", action="store_true",
         help="include other public code hosts in Sourcegraph's index (default: GitHub)",

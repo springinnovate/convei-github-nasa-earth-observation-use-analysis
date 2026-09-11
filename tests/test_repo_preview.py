@@ -3,6 +3,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
+import re
 import unittest
 from unittest.mock import patch
 
@@ -24,15 +25,53 @@ class RepositoryPreviewTests(unittest.TestCase):
     """Verify literal queries, first-result shutdown, evidence, and empty results."""
 
     def test_query_quotes_phrase_and_limits_public_scope(self) -> None:
-        """Keep special characters inside the literal content parameter."""
+        """Escape regex and query syntax in the user-supplied phrase."""
 
         search_phrase = 'ATL03 "quoted" \\ repo:elsewhere'
         search_query = build_preview_query(search_phrase, False)
-        self.assertIn('content:' + json.dumps(search_phrase), search_query)
+        decoded_pattern = search_query.split('content:', 1)[1].rsplit(' count:', 1)[0]
+        self.assertNotIn(' ', decoded_pattern)
+        self.assertNotIn('"', decoded_pattern)
+        # Python re uses a different syntax for the RE2 Unicode hex escapes.
+        decoded_pattern = re.sub(
+            r'\\x\{([0-9a-f]+)\}',
+            lambda hex_match: re.escape(chr(int(hex_match.group(1), 16))),
+            decoded_pattern,
+        )
+        self.assertIsNotNone(re.search(decoded_pattern, search_phrase))
+        self.assertIn('patternType:regexp case:no', search_query)
         self.assertIn(r'repo:^github\.com/', search_query)
         self.assertIn('visibility:public', search_query)
         self.assertIn('count:1 timeout:15s', search_query)
         self.assertNotIn('repo:', build_preview_query('ATL03', True))
+
+    def test_product_boundaries_reject_substrings_and_keep_filenames(self) -> None:
+        """Reject MATL03 and suffix collisions while retaining product tokens."""
+
+        search_query = build_preview_query("ATL03", False)
+        encoded_pattern = search_query.split('content:', 1)[1].rsplit(' count:', 1)[0]
+        search_pattern = re.compile(encoded_pattern, re.IGNORECASE)
+        for file_contents in (
+            "MATL03", "matl03", "ATL030", "ATL03X", "prefixATL03", "xATL03x",
+        ):
+            with self.subTest(file_contents=file_contents):
+                self.assertIsNone(search_pattern.search(file_contents))
+        for file_contents in (
+            "ATL03", 'load("ATL03")', "ATL03_007", "ATL03.h5", "ATL03-007",
+            "/data/ATL03/file.h5", "test_atl03", "read ATL03 data",
+        ):
+            with self.subTest(file_contents=file_contents):
+                self.assertIsNotNone(search_pattern.search(file_contents))
+
+    def test_domain_punctuation_remains_literal(self) -> None:
+        """Do not allow regex dots to turn a domain into wildcard matches."""
+
+        search_query = build_preview_query("earthdata.nasa.gov", False)
+        encoded_pattern = search_query.split('content:', 1)[1].rsplit(' count:', 1)[0]
+        search_pattern = re.compile(encoded_pattern, re.IGNORECASE)
+        self.assertIsNotNone(search_pattern.search("https://earthdata.nasa.gov/"))
+        self.assertIsNone(search_pattern.search("earthdataXnasaXgov"))
+        self.assertIsNone(search_pattern.search("notearthdata.nasa.gov"))
 
     def test_first_match_stops_consumption_and_closes_connection(self) -> None:
         """Stop at the first match and close the generator before printing results."""

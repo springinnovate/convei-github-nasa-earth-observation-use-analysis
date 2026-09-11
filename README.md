@@ -45,7 +45,7 @@ nasa-repo-preview ATL03 > first-repository.json
 ```
 
 `--all-hosts` includes other public code hosts indexed by Sourcegraph. Searches
-use a literal phrase, a one-result limit, a 15-second server search timeout,
+use a delimited literal phrase, a one-result limit, a 15-second server search timeout,
 and a 20-second socket timeout. These timeouts are not a strict wall-clock
 deadline. You can interrupt with Ctrl+C. JSON results go to stdout; status and
 search warnings go to stderr. Exit codes are 0 for a match, 1 for an error,
@@ -56,6 +56,16 @@ catalog. The result is evidence to inspect: a mention alone does not establish
 use. Coverage is Sourcegraph's public index, with forks and archived repositories
 excluded by default. No returned match does not prove that no repositories use
 the product. Search limits and exclusions reported by the service are displayed.
+
+Matching is case-insensitive and rejects occurrences joined directly to ASCII
+letters or digits: searching `ATL03` will not match `MATL03`, `ATL030`, or
+`ATL03X`. Underscores, dots, slashes, hyphens, quotes, and whitespace count as
+separators, so it can find `ATL03_007`, `ATL03.h5`, and `test_atl03`. This is a
+product-token rule rather than Python-style whole-word matching, which would
+exclude underscore-separated filenames. Punctuation in your search phrase is
+literal (for example, the dots in `earthdata.nasa.gov` are not wildcards).
+These boundaries remove substring collisions; context is still needed to decide
+whether a matching token refers to the NASA product.
 
 The existing `sourcegraph-search` command accepts a full Sourcegraph query for
 larger searches. The optional catalog lookup below serves a different purpose:
