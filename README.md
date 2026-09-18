@@ -13,6 +13,65 @@ python -m pip install -e .
 
 Run this command again after pulling changes that add command-line tools.
 
+## Collect the NASA product catalog
+
+Save the public collections tagged for NASA's Earth Observing System Data and
+Information System (EOSDIS) in the Common Metadata Repository (CMR):
+
+```console
+nasa-catalog-collect --output nasa-catalog
+```
+
+Choose a new output directory. The command retrieves successive catalog pages
+and prints the collection and product counts as it runs.
+
+| File | Contents |
+| --- | --- |
+| `collections.jsonl` | Original collection records, each with its request URL, retrieval time, and page number. Written as pages arrive. |
+| `products.jsonl` | One product per provider and exact short name, with its collection versions, titles, descriptions, identifiers, and candidate search terms. Written when collection ends. |
+| `summary.json` | Catalog scope, request URL, timestamps, reported totals, saved counts, warnings, and run status. |
+
+JSON Lines (`.jsonl`) files contain one JSON object per line. In `products.jsonl`,
+`collections` preserves the details of each version. `candidate_signatures`
+contains terms drawn from short names, entry IDs, and collection concept IDs.
+Each term has a `sources` list naming the collection and metadata field it came
+from, plus a `review_status` of `unreviewed`.
+
+Versions sharing the same provider and exact short name are grouped together;
+identical search terms appear once within that group. Names from different
+providers remain separate. Review the terms for ambiguity before using them in
+repository searches, for example `nasa-repo-search ATL03 --output atl03-search`.
+
+For a small trial run, filter to one product and request one record per page:
+
+```console
+nasa-catalog-collect --short-name ATL03 --page-size 1 --output catalog-atl03
+```
+
+`--page-size` accepts 1–2000 records (default: 500). `--timeout` sets the socket
+connection/read timeout in seconds (default: 30). `--ca-bundle` uses the
+certificate settings described below. All commands can also be launched as a
+module: `python -m nasa_eo_search.catalog --output nasa-catalog`.
+
+Check `summary.json` before using the catalog:
+
+| Status | Meaning | Exit code |
+| --- | --- | --- |
+| `complete` | Pagination ended, reported totals stayed consistent, and the unique collection count matches the reported total. An empty result is also complete. | 0 |
+| `incomplete` | Counts changed or disagreed, records repeated, or a pagination cursor repeated. See `warnings`. | 4 |
+| `failed` | A request, response, or output-file error stopped the run. See `error`. | 1 |
+| `interrupted` | Collection was interrupted with Ctrl+C. | 130 |
+| `running` | Collection is active, or the process stopped before recording a final status. | — |
+
+On a request failure or Ctrl+C, previously collected records and product groups
+are retained. Rerun in a new directory to collect a fresh catalog. A file-system
+failure may also prevent output files or the final summary from being written;
+the command reports that error in the terminal.
+
+Coverage is the public EOSDIS-tagged CMR catalog at retrieval time, with an
+optional short-name filter. CMR is a live catalog: records can change during a
+run. The command follows NASA's [Search After pagination](https://cmr.earthdata.nasa.gov/search/site/docs/search/api.html#search-after).
+
 ## Collect repository matches
 
 Search for a product identifier and save the results:
