@@ -1,4 +1,4 @@
-"""Offline checks for the single-collection Phase 1 preview."""
+"""Test NASA catalog requests, product previews, and command-line error handling."""
 
 from contextlib import redirect_stderr, redirect_stdout
 from email.message import Message
@@ -14,10 +14,10 @@ import certifi
 
 from nasa_eo_search.cmr import (
     CatalogError,
-    build_collection_request,
-    fetch_first_collection,
+    build_eosdis_collection_request,
+    fetch_first_cmr_collection,
     main,
-    summarize_collection,
+    build_product_search_term_preview,
 )
 
 
@@ -52,8 +52,8 @@ class CatalogPreviewTests(unittest.TestCase):
                     as context_factory_mock,
                     patch.dict(os.environ, {}, clear=True),
                 ):
-                    search_request = build_collection_request("ATL03")
-                    collection_record = fetch_first_collection(
+                    search_request = build_eosdis_collection_request("ATL03")
+                    collection_record = fetch_first_cmr_collection(
                         search_request, 20, custom_bundle
                     )
                     self.assertEqual(collection_record, EXAMPLE_COLLECTION)
@@ -89,12 +89,12 @@ class CatalogPreviewTests(unittest.TestCase):
                 response_stream.headers = response_headers
                 with patch("nasa_eo_search.cmr.urlopen", return_value=response_stream):
                     if expected_empty:
-                        self.assertIsNone(fetch_first_collection(
-                            build_collection_request(None), 20, None
+                        self.assertIsNone(fetch_first_cmr_collection(
+                            build_eosdis_collection_request(None), 20, None
                         ))
                     else:
                         with self.assertRaises(CatalogError):
-                            fetch_first_collection(build_collection_request(None), 20, None)
+                            fetch_first_cmr_collection(build_eosdis_collection_request(None), 20, None)
 
     def test_transport_errors_become_catalog_errors(self) -> None:
         """Wrap network, timeout, and HTTP failures for readable CLI errors."""
@@ -106,13 +106,13 @@ class CatalogPreviewTests(unittest.TestCase):
             with self.subTest(transport_error=transport_error):
                 with patch("nasa_eo_search.cmr.urlopen", side_effect=transport_error):
                     with self.assertRaises(CatalogError):
-                        fetch_first_collection(build_collection_request(None), 20, None)
+                        fetch_first_cmr_collection(build_eosdis_collection_request(None), 20, None)
 
     def test_candidate_terms_preserve_source_fields_and_deduplicate(self) -> None:
-        """Expose observed identifiers as unreviewed terms without invented names."""
+        """Preserve each identifier's source field and combine repeated terms."""
 
         collection_record = {**EXAMPLE_COLLECTION, "entry_id": "ATL03"}
-        collection_preview = summarize_collection(collection_record)
+        collection_preview = build_product_search_term_preview(collection_record)
         self.assertEqual(collection_preview["candidate_signatures"], [
             {"term": "ATL03", "source_field": "short_name", "review_status": "unreviewed"},
             {"term": EXAMPLE_COLLECTION["id"], "source_field": "id",
@@ -129,7 +129,7 @@ class CatalogPreviewTests(unittest.TestCase):
             results_output = StringIO()
             diagnostics_output = StringIO()
             with (
-                patch("nasa_eo_search.cmr.fetch_first_collection") as fetch_mock,
+                patch("nasa_eo_search.cmr.fetch_first_cmr_collection") as fetch_mock,
                 redirect_stdout(results_output), redirect_stderr(diagnostics_output),
             ):
                 if isinstance(collection_result, Exception):

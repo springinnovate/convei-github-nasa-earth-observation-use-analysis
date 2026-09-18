@@ -8,8 +8,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from nasa_eo_search.repo_preview import build_repository_query
-from nasa_eo_search.repo_search import collect_search_results, main
+from nasa_eo_search.repo_preview import build_sourcegraph_product_query
+from nasa_eo_search.repo_search import save_search_stream_and_summarize, main
 from nasa_eo_search.sourcegraph import ServerSentEvent, SourcegraphError
 
 
@@ -19,7 +19,7 @@ class FullSearchTests(unittest.TestCase):
     def test_query_includes_all_results_forks_and_archives(self) -> None:
         """Remove the preview limit while retaining the bounded product pattern."""
 
-        search_query = build_repository_query("ATL03", False, collect_all=True)
+        search_query = build_sourcegraph_product_query("ATL03", False, collect_all=True)
         self.assertIn("count:all", search_query)
         self.assertIn("fork:yes archived:yes", search_query)
         self.assertIn("timeout:60s", search_query)
@@ -42,7 +42,7 @@ class FullSearchTests(unittest.TestCase):
             ServerSentEvent("progress", '{"done":true,"matchCount":3}'),
             ServerSentEvent("done", "{}"),
         ]
-        run_summary = collect_search_results(
+        run_summary = save_search_stream_and_summarize(
             search_events, "query", matches_output, events_output, StringIO(),
         )
         self.assertEqual(run_summary["status"], "finished_no_reported_limits")
@@ -65,7 +65,7 @@ class FullSearchTests(unittest.TestCase):
              ServerSentEvent("progress", '{"done":true}'), ServerSentEvent("done", "{}")],
         ):
             with self.subTest(search_events=search_events):
-                run_summary = collect_search_results(
+                run_summary = save_search_stream_and_summarize(
                     search_events, "query", StringIO(), StringIO(), StringIO(),
                 )
                 self.assertEqual(run_summary["status"], "incomplete")
@@ -88,7 +88,7 @@ class FullSearchTests(unittest.TestCase):
                 raise search_error
 
             matches_output = StringIO()
-            run_summary = collect_search_results(
+            run_summary = save_search_stream_and_summarize(
                 interrupted_events(), "query", matches_output, StringIO(), StringIO(),
             )
             self.assertEqual(run_summary["status"], expected_status)

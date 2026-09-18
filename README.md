@@ -1,199 +1,145 @@
-# Finding NASA Earth observation data in public software
+# NASA data references in public code
 
-> Which public GitHub repositories contain evidence of direct or indirect use of NASA Earth observation data products, and how are those products used?
+Command-line tools for finding NASA product references in public repositories
+through Sourcegraph and looking up product identifiers in NASA's catalog.
 
-We plan to examine public GitHub repositories to understand where and how NASA Earth observation data products are used in public software, both directly and through downstream products that may no longer identify NASA as a source. Our goal is to produce a reproducible, evidence-backed picture of this use. We expect the work to yield two reusable resources: a traceable catalog of NASA products and their search signatures, and a browsable and downloadable catalog of repositories, matches, and supporting evidence. Together, these products will show which NASA data products appear in public software, the purposes they appear to serve, and the strength of the evidence for each identified use. We expect to adapt our methods as the work reveals new terminology, relationships, and forms of use.
+## Install
 
-Our intial approach is to break this into three phases:
-
-1. Identify NASA Earth observation data products in the Common Metadata Repository (CMR) and convert their names, identifiers, access paths, and filename conventions into searchable terms and patterns. We will expand these as we discover additional identifiers and conventions. The primary output of this phase will be a versioned catalog of products and their search signatures, documenting the evidence linking each term or pattern to a product. The catalog will be independent of any single search provider, and every entry will be traceable to CMR or another authoritative source.
-
-2. Search public GitHub repository contents using those product search terms and patterns, characterize the repositories containing matches, and preserve the evidence linking each match to a NASA Earth observation data product. The resulting evidence base will be useful in its own right and will also reveal downstream products, lineage relationships, and additional search terms to pursue in Phase 3.
-
-3. Build on the downstream products and lineage relationships we discover in  Phase 2 and identify data products derived from NASA Earth observation data, document their lineage to the original NASA source products, and search public GitHub repository contents for references to those downstream products that do not mention NASA or the source products.
-
-We will present the Phase 2 evidence base as a catalog of GitHub repositories that reference NASA Earth observation data products. We'll set this up so that users will be able to browse or filter the catalog by NASA product, mission, instrument, repository, programming language, application area, type of reference, and confidence in the match.
-
-## Resources we'll use
-
-NASA's [Common Metadata Repository](https://www.earthdata.nasa.gov/about/esdis/eosdis/cmr) is a searchable catalog of Earth science datasets. It includes NASA Earth observation products, as well as data outside our scope. In Phase 1, we will use it as the starting point for identifying relevant products and deriving their search terms and patterns.
-
-[Sourcegraph Public Code Search](https://sourcegraph.com/search) provides keyword, regular expression, and filename searches across its index of public GitHub repositories. It will be our initial code search provider for Phase 2. Because the product and search signature catalog will be provider independent, we will be able to use additional search providers as the work develops.
-
-## Collect all returned references for a product
-
-Use `nasa-repo-search` to collect a full search response instead of stopping
-after one file:
+Use Python 3.10 or newer. From the repository directory, run:
 
 ```console
 python -m pip install -e .
+```
+
+Run this command again after pulling changes that add command-line tools.
+
+## Collect repository matches
+
+Search for a product identifier and save the results:
+
+```console
 nasa-repo-search ATL03 --output atl03-search
 ```
 
-The output directory must be new, so existing results cannot be overwritten.
-It contains:
+Choose a new output directory for each run. It contains:
 
-- `matches.jsonl`: every returned match, saved as it arrives, with the query and
-  original Sourcegraph evidence (repository, file, revision, and matching lines).
-- `events.jsonl`: server progress, warnings, and completion events.
-- `summary.json`: run times, saved-record and distinct-repository counts,
-  the query, search scope, and completion status.
+| File | Contents |
+| --- | --- |
+| `matches.jsonl` | One JSON object per returned match, including the query, repository, file, revision, and matching lines. |
+| `events.jsonl` | Search progress, warnings, and completion messages from Sourcegraph. |
+| `summary.json` | Query, run times, saved-record count, number of repositories with matches, and completion status. |
 
-This command requests `count:all`, includes forks and archived repositories,
-and keeps collecting until the server ends the stream. It uses the same product
-boundaries as the preview, so `ATL03` does not match `MATL03`. Add `--all-hosts`
-to search other public code hosts in Sourcegraph's index as well as GitHub.
-Counts on screen describe saved results, not repositories searched. A repository
-can have many matches and a file can appear in more than one streamed record.
+Matches are written as they arrive. The terminal shows the number of saved
+records and distinct repositories containing matches.
 
-The completion status matters:
-
-- `finished_no_reported_limits` (exit 0): received both final progress and the
-  end-of-stream event, with no reported skips or alerts. This applies only to
-  the queried index and its search scope.
-- `incomplete` (exit 4): the server reported exclusions/limits/alerts or failed
-  to provide both completion signals. Inspect the recorded warnings. They are
-  retained conservatively even if a later progress event omits them.
-- `failed` (exit 1) or `interrupted` (exit 130): retained results are partial.
-- `running`: no final summary was written, such as after a forced process stop.
-
-`count:all` removes our result cap; it cannot remove Sourcegraph's server limits
-or find code absent from its index. The server search timeout is 60 seconds,
-with a 65-second socket timeout; neither guarantees a total wall-clock deadline.
-The command does not yet split incomplete searches or resume them automatically.
-Reruns use a new directory and may return duplicates. Partial saved results are
-not evidence that all repositories have been searched.
-
-For the research goal of *all* matching public repositories, this is the
-collection step. Broader searches may need separate repository-scoped queries
-when limits are reported, plus deduplication and a recorded inventory of which
-query scopes finished. Even then, establishing GitHub-wide coverage requires
-an independently enumerated repository inventory and searching gaps outside
-Sourcegraph. The public index alone cannot certify that census.
-
-## Try finding one NASA data reference in public code
-
-Run this to search public GitHub repository contents for a product name or phrase
-and stop at the first matching file:
+The search includes public GitHub repositories, forks, and archived repositories
+in Sourcegraph's index. Add `--all-hosts` to include other indexed public hosts:
 
 ```console
-python -m pip install -e .
-nasa-repo-preview ATL03
+nasa-repo-search ATL03 --all-hosts --output atl03-all-hosts
 ```
 
-The command contacts Sourcegraph's public code search and prints a repository
-link, star count when available, file path, language, commit, and matching code
-lines. It closes the connection as soon as the first file match arrives. The
-first match is whichever arrives first; it is not ranked as the best example.
-An immediate status message and subsequent search progress appear on screen.
+Searches are case-insensitive. Product terms are matched at line boundaries or
+separators such as spaces, quotes, underscores, dots, slashes, and hyphens.
+For example, `ATL03` matches `ATL03_007`, `ATL03.h5`, and `test_atl03`.
+Punctuation within the search phrase is treated literally.
 
-Other examples:
+The command requests all results using Sourcegraph's `count:all` option. Coverage
+and completion apply to Sourcegraph's indexed content. A matching reference
+needs review in its code context to determine how the product is used.
+
+### Run status
+
+Check `summary.json` after a search:
+
+| Status | Meaning | Exit code |
+| --- | --- | --- |
+| `finished_no_reported_limits` | Sourcegraph sent final progress and completion messages with an empty warning list. | 0 |
+| `incomplete` | The run received warnings or ended before both completion messages arrived. Inspect `events.jsonl`. | 4 |
+| `failed` | A connection, response, or file error stopped collection. Previously saved matches remain available. | 1 |
+| `interrupted` | The search was interrupted with Ctrl+C. Previously saved matches remain available. | 130 |
+| `running` | Collection is active, or the process stopped before writing its final summary. | — |
+
+Server warnings are retained throughout the run. The server search timeout is
+60 seconds; the socket timeout allows 65 seconds for a connection or read.
+
+## Preview one repository match
+
+Display the first matching file:
 
 ```console
-nasa-repo-preview "earthdata.nasa.gov"
-nasa-repo-preview ATL03 --all-hosts
+nasa-repo-preview ATL03
+nasa-repo-preview "earthdata.nasa.gov" --all-hosts
+```
+
+The JSON output includes the repository URL, stars when available, file path,
+language, commit, and matching lines. GitHub matches include a link to the file
+at the reported revision. The command exits after the first file arrives.
+Its default scope excludes forks and archived repositories.
+
+Save the preview by redirecting standard output:
+
+```console
 nasa-repo-preview ATL03 > first-repository.json
 ```
 
-`--all-hosts` includes other public code hosts indexed by Sourcegraph. Searches
-use a delimited literal phrase, a one-result limit, a 15-second server search timeout,
-and a 20-second socket timeout. These timeouts are not a strict wall-clock
-deadline. You can interrupt with Ctrl+C. JSON results go to stdout; status and
-search warnings go to stderr. Exit codes are 0 for a match, 1 for an error,
-2 for invalid arguments, and 3 if no match is returned.
+Progress and errors go to standard error. Exit code 3 means the search returned
+no matching file. The server timeout is 15 seconds and the socket timeout is
+20 seconds.
 
-This tests the repository-discovery step directly. It does not contact NASA's
-catalog. The result is evidence to inspect: a mention alone does not establish
-use. Coverage is Sourcegraph's public index, with forks and archived repositories
-excluded by default. No returned match does not prove that no repositories use
-the product. Search limits and exclusions reported by the service are displayed.
-
-Matching is case-insensitive and rejects occurrences joined directly to ASCII
-letters or digits: searching `ATL03` will not match `MATL03`, `ATL030`, or
-`ATL03X`. Underscores, dots, slashes, hyphens, quotes, and whitespace count as
-separators, so it can find `ATL03_007`, `ATL03.h5`, and `test_atl03`. This is a
-product-token rule rather than Python-style whole-word matching, which would
-exclude underscore-separated filenames. Punctuation in your search phrase is
-literal (for example, the dots in `earthdata.nasa.gov` are not wildcards).
-These boundaries remove substring collisions; context is still needed to decide
-whether a matching token refers to the NASA product.
-
-The existing `sourcegraph-search` command accepts a full Sourcegraph query for
-larger searches. The optional catalog lookup below serves a different purpose:
-finding names to search for. If a command is missing from your PATH, use
-`python -m nasa_eo_search.repo_preview ATL03` in the installed environment.
-
-## Optional: preview a product in NASA's catalog
-
-The `nasa-product-preview` command asks NASA CMR for one EOSDIS collection,
-prints its name, version, provider, collection ID, and candidate code search
-terms, then exits. This gives us a small working example to inspect before we
-build the larger catalog.
-
-Install or update the commands with Python 3.10 or newer (run this again if you
-installed the earlier Sourcegraph tool):
-
-```console
-python -m pip install -e .
-nasa-product-preview
-```
-
-To try a recognizable product, use its short name:
+## Look up a NASA product
 
 ```console
 nasa-product-preview --short-name ATL03
 ```
 
-For example, an ATL03 result can include `ATL03`, a collection entry identifier
-such as `ATL03_007`, and a CMR concept ID. Each candidate term identifies the
-metadata field it came from and is marked unreviewed. The output also includes
-the request URL and retrieval time. Versions and CMR's first result can change;
-this command does not select or promise the newest version.
+This queries NASA's Common Metadata Repository (CMR) for one collection tagged
+for the Earth Observing System Data and Information System (EOSDIS). A collection
+describes a dataset and version. The output contains its title, description,
+version, provider, and identifiers that can be used as code-search terms.
+Each term records the catalog field it came from.
 
-The command prints an immediate status message, requests `page_size=1` through
-the [CMR Search API](https://cmr.earthdata.nasa.gov/search/site/docs/search/api.html),
-and stops after that response. It needs no NASA account or token. It downloads
-collection metadata only. The `gov.nasa.eosdis` tag selects an initial catalog
-scope; whether each collection fits our NASA product definition still needs
-review. No pagination, granule downloads, or GitHub searches run automatically.
+Omit `--short-name` to return the first collection selected by CMR. Use
+`--timeout 10` to set the connection/read timeout in seconds; the default is 20.
+Exit code 3 means the catalog returned no matching collection.
 
-Success demonstrates that we can reach CMR and extract traceable candidate terms.
-It does not yet tell us whether those terms find relevant GitHub repositories,
-whether a mention represents use, or how complete the product catalog will be.
-Filename conventions and additional aliases will need further evidence.
+## Run a custom Sourcegraph query
 
-Output is formatted JSON, which is readable on screen and can also be saved:
+Use `sourcegraph-search` to supply filters and patterns directly:
 
 ```console
-nasa-product-preview --short-name ATL03 > first-product.json
+sourcegraph-search --trace "repo:^github.com/ ATL03 lang:Python count:100 timeout:30s"
 ```
 
-Status messages go to standard error so the saved JSON contains only the result.
-Exit codes are 0 for a result, 1 for an error, 2 for invalid arguments, and 3 for
-no matching collection. A missing match is reported explicitly. The default
-connection/read timeout is 20 seconds; `--timeout 10` changes it. This is a
-socket timeout, not a guaranteed total runtime. Ctrl+C interrupts the request.
-TLS uses Certifi to support Windows/Conda certificate handling; `--ca-bundle PATH`
-or `SSL_CERT_FILE` can supply a private certificate authority bundle if required.
+Results are JSON Lines on standard output. `--trace` prints received event types
+to standard error; `--raw-events` writes all decoded events to standard output.
+See the [Sourcegraph query syntax](https://sourcegraph.com/docs/code-search/queries)
+for available filters.
 
-If the command is not on your PATH, use the same Python environment directly:
+## Connection settings
+
+The public services used by these commands accept unauthenticated requests.
+For Sourcegraph authentication, set `SOURCEGRAPH_TOKEN`. The
+`sourcegraph-search` command also accepts `--endpoint` for another instance.
+
+HTTPS connections use Certifi's certificate authority bundle. If your network
+requires a private certificate authority, provide its PEM file with
+`--ca-bundle PATH` or the `SSL_CERT_FILE` environment variable.
+
+If a command is missing from PATH, use the Python module in your installed
+environment, for example:
 
 ```console
-python -m nasa_eo_search.cmr --short-name ATL03
+python -m nasa_eo_search.repo_search ATL03 --output atl03-search
 ```
 
-After inspecting the returned terms, a separate manual Phase 2 check can use the
-existing search command:
+The other modules are `nasa_eo_search.repo_preview`, `nasa_eo_search.cmr`, and
+`nasa_eo_search.sourcegraph`. Run any command with `--help` for its options.
 
-```console
-sourcegraph-search --trace "repo:^github.com/ ATL03 count:10 timeout:15s"
-```
-
-This searches Sourcegraph's indexed GitHub repositories and returns candidate
-references for inspection. It is not a measure of complete GitHub coverage.
-
-Run the offline test suite with:
+## Tests
 
 ```console
 python -m unittest discover -s tests -v
 ```
+
+The tests use recorded responses and mock network connections.

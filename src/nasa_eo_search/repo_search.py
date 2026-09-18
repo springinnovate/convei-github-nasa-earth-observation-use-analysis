@@ -12,7 +12,7 @@ import sys
 import time
 from typing import Any, Iterable, TextIO
 
-from nasa_eo_search.repo_preview import build_repository_query
+from nasa_eo_search.repo_preview import build_sourcegraph_product_query
 from nasa_eo_search.sourcegraph import (
     DEFAULT_SOURCEGRAPH_ENDPOINT,
     ServerSentEvent,
@@ -23,14 +23,26 @@ from nasa_eo_search.sourcegraph import (
 )
 
 
-def collect_search_results(
+def save_search_stream_and_summarize(
     search_events: Iterable[ServerSentEvent],
     search_query: str,
     matches_output: TextIO,
     events_output: TextIO,
     diagnostics_output: TextIO,
 ) -> dict[str, Any]:
-    """Save every match while tracking server completion and incompleteness.
+    """Write Sourcegraph matches and events to files and return a run summary.
+
+    Consume the event stream through its completion event. Write matches with
+    their query to matches_output, write other events to events_output, and
+    flush each batch so collected results are available during the search.
+    Count saved records and distinct repositories, print progress, and retain
+    each distinct server warning.
+
+    Use the returned dictionary to write summary.json and choose the command's
+    exit status. A finished status requires final progress, a completion event,
+    and an empty warning list. Connection errors, file errors, and keyboard
+    interruption produce a summary of the partial run. The caller closes the
+    input stream and output files.
 
     Args:
         search_events: Events from the caller-owned Sourcegraph response stream.
@@ -130,7 +142,11 @@ def collect_search_results(
 
 
 def main(argument_values: list[str] | None = None) -> int:
-    """Collect all returned matches in a new output directory.
+    """Run nasa-repo-search to save a product search in a new directory.
+
+    Parse the phrase and output path, create matches.jsonl, events.jsonl, and
+    summary.json, and stream public code matches from Sourcegraph into those
+    files. Print saved-result counts and the final status to standard error.
 
     Args:
         argument_values: Arguments without the executable name; defaults to sys.argv.
@@ -138,7 +154,7 @@ def main(argument_values: list[str] | None = None) -> int:
     Returns:
         Zero when the service finishes with no reported limits, four for an
         incomplete run, one for failure, or 130 for interruption. Argparse exits
-        with two for invalid arguments. No status asserts coverage of all GitHub.
+        with two for invalid arguments. Completion describes the queried index.
     """
 
     argument_parser = argparse.ArgumentParser(
@@ -159,7 +175,7 @@ def main(argument_values: list[str] | None = None) -> int:
     search_phrase = parsed_arguments.phrase.strip()
     if not search_phrase or any(ord(character) < 32 for character in search_phrase):
         argument_parser.error("phrase must be nonempty and contain no control characters")
-    search_query = build_repository_query(
+    search_query = build_sourcegraph_product_query(
         search_phrase, parsed_arguments.all_hosts, collect_all=True,
     )
     output_directory = parsed_arguments.output.resolve()
@@ -169,7 +185,7 @@ def main(argument_values: list[str] | None = None) -> int:
         "endpoint": DEFAULT_SOURCEGRAPH_ENDPOINT,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "scope": "public indexed default-branch content; includes forks and archives",
-        "coverage_note": "Sourcegraph index only; never a census of all public repositories.",
+        "coverage_note": "Results cover public repository content in Sourcegraph's index.",
     }
     try:
         output_directory.mkdir(parents=True, exist_ok=False)
@@ -189,7 +205,7 @@ def main(argument_values: list[str] | None = None) -> int:
                 ca_bundle_path=parsed_arguments.ca_bundle,
             )) as search_events,
         ):
-            run_metadata.update(collect_search_results(
+            run_metadata.update(save_search_stream_and_summarize(
                 search_events, search_query, matches_output, events_output, sys.stderr,
             ))
         with summary_path.open("w", encoding="utf-8") as summary_output:
@@ -211,8 +227,8 @@ def main(argument_values: list[str] | None = None) -> int:
         print(run_metadata.get("error", "Search failed."), file=sys.stderr)
         return 1
     print(
-        "This run is incomplete. Retained matches are useful, but are not all results; "
-        "inspect summary.json and events.jsonl for missing completion or service limits.",
+        "Search incomplete. Inspect summary.json and events.jsonl "
+        "for completion status and service warnings.",
         file=sys.stderr,
     )
     return 4

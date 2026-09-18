@@ -22,25 +22,30 @@ from nasa_eo_search.sourcegraph import (
 )
 
 
-def build_repository_query(
+def build_sourcegraph_product_query(
     search_phrase: str, all_hosts: bool, *, collect_all: bool = False,
 ) -> str:
-    """Build a delimited public-content search for a preview or full collection.
+    """Convert a product term into a Sourcegraph file-content query.
+
+    Escape the supplied text and surround it with a pattern that accepts line
+    edges or non-alphanumeric separators. Add filters for public repositories,
+    the selected code hosts, result count, and search duration. For example,
+    ATL03 matches a token in ``ATL03_007`` or ``test_atl03``.
 
     Args:
         search_phrase: Literal product identifier or phrase to find in contents.
-            Adjacent ASCII letters or digits prevent a match. Underscores and
-            punctuation count as delimiters, allowing product filenames.
+            Underscores and punctuation count as separators in product filenames.
         all_hosts: Include every public code host indexed by Sourcegraph.
         collect_all: Request all results, including forks and archived repos.
 
     Returns:
-        A case-insensitive Sourcegraph regular expression query. Full collection
-        uses a 60-second server timeout; previews use 15 seconds. User text is
-        escaped, not interpreted as regex.
+        A case-insensitive query string ready for stream_sourcegraph_search_events.
+        Full collection includes forks and archives with a 60-second server
+        timeout; previews request one result with a 15-second timeout.
     """
 
-    # RE2 does not support lookbehind. Consume delimiters on either side instead.
+    # Sourcegraph uses RE2, a regular-expression engine. Its syntax requires
+    # consuming these separators rather than checking them with lookbehind.
     # Quoting content makes Sourcegraph treat the regex as literal text. Encode
     # whitespace and quotes so the pattern remains one unquoted query parameter.
     escaped_phrase = "".join(
@@ -60,10 +65,14 @@ def build_repository_query(
     )
 
 
-def first_content_match(
+def read_first_content_match(
     search_events: Iterable[ServerSentEvent], diagnostics_output: TextIO,
 ) -> dict[str, Any] | None:
-    """Consume events only until the first matching file is received.
+    """Read a Sourcegraph event stream and return the first file-content match.
+
+    Process progress and alert events while waiting for a matches event. Return
+    its first content match immediately, leaving the caller to close the stream.
+    This supplies the single file displayed by ``nasa-repo-preview``.
 
     Args:
         search_events: Sourcegraph events; the caller owns and closes the stream.
@@ -104,8 +113,12 @@ def first_content_match(
     raise SourcegraphProtocolError("Sourcegraph stream ended before search completion.")
 
 
-def summarize_repository_match(content_match: dict[str, Any]) -> dict[str, Any]:
-    """Format a file match with enough evidence to inspect it on the code host.
+def format_repository_match(content_match: dict[str, Any]) -> dict[str, Any]:
+    """Turn a Sourcegraph file match into a repository preview for display.
+
+    Extract the repository name, star count, file path, language, and revision.
+    Build a GitHub link to that revision and convert zero-based line offsets to
+    the one-based line numbers readers see in the file.
 
     Args:
         content_match: A Sourcegraph content match with repository and path fields.
@@ -114,13 +127,15 @@ def summarize_repository_match(content_match: dict[str, Any]) -> dict[str, Any]:
         Repository, stars, file, language, revision, and numbered matching lines.
 
     Raises:
-        SourcegraphProtocolError: If required repository or path fields are missing.
+        ValueError: If repository or path is missing, empty, or not a string.
     """
 
     repository_name = content_match.get("repository")
     file_path = content_match.get("path")
-    if not isinstance(repository_name, str) or not isinstance(file_path, str):
-        raise SourcegraphProtocolError("Match is missing its repository or file path.")
+    if not isinstance(repository_name, str) or not repository_name.strip():
+        raise ValueError("Match repository must be a nonempty string.")
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise ValueError("Match path must be a nonempty string.")
     commit_id = content_match.get("commit")
     repository_url = f"https://{repository_name}"
     file_url = None
@@ -145,7 +160,12 @@ def summarize_repository_match(content_match: dict[str, Any]) -> dict[str, Any]:
 
 
 def main(argument_values: list[str] | None = None) -> int:
-    """Search public repositories, print the first reference, and close the stream.
+    """Run nasa-repo-preview to display one public code reference to a product.
+
+    Parse the search phrase and connection options, read the first matching file
+    from Sourcegraph, and print the formatted repository preview as JSON to
+    standard output. Close the search stream after retrieving the match. Progress
+    and errors go to standard error.
 
     Args:
         argument_values: Arguments without the executable name; defaults to sys.argv.
@@ -161,7 +181,7 @@ def main(argument_values: list[str] | None = None) -> int:
     )
     argument_parser.add_argument(
         "phrase",
-        help="delimited literal term, e.g. ATL03; excludes substrings like MATL03",
+        help="product term or phrase, matched at separators such as spaces or underscores",
     )
     argument_parser.add_argument(
         "--all-hosts", action="store_true",
@@ -172,7 +192,7 @@ def main(argument_values: list[str] | None = None) -> int:
     search_phrase = parsed_arguments.phrase.strip()
     if not search_phrase or any(ord(character) < 32 for character in search_phrase):
         argument_parser.error("phrase must be nonempty and contain no control characters")
-    search_query = build_repository_query(search_phrase, parsed_arguments.all_hosts)
+    search_query = build_sourcegraph_product_query(search_phrase, parsed_arguments.all_hosts)
     print(
         f"Searching public repositories via Sourcegraph for {search_phrase!r}...",
         file=sys.stderr, flush=True,
@@ -183,7 +203,7 @@ def main(argument_values: list[str] | None = None) -> int:
             os.environ.get("SOURCEGRAPH_TOKEN"), 20.0,
             ca_bundle_path=parsed_arguments.ca_bundle,
         )) as search_events:
-            content_match = first_content_match(search_events, sys.stderr)
+            content_match = read_first_content_match(search_events, sys.stderr)
         if content_match is None:
             print(
                 "No file match returned by this search. Check scope/limits above.",
@@ -194,10 +214,10 @@ def main(argument_values: list[str] | None = None) -> int:
             "query": search_query,
             "search_url": "https://sourcegraph.com/search?" + urlencode({"q": search_query}),
             "retrieved_at": datetime.now(timezone.utc).isoformat(),
-            "match": summarize_repository_match(content_match),
+            "match": format_repository_match(content_match),
         }, indent=2, ensure_ascii=True))
         print("Found one matching file; closed the search and finished.", file=sys.stderr)
-    except SourcegraphError as search_error:
+    except (SourcegraphError, ValueError) as search_error:
         print(f"nasa-repo-preview: {search_error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

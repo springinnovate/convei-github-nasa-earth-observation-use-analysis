@@ -1,4 +1,9 @@
-"""Preview one NASA EOSDIS collection and candidate code search terms."""
+"""Look up a NASA data collection and extract identifiers to search for in code.
+
+NASA's Common Metadata Repository (CMR) describes data collections. The catalog
+request selects records tagged for the Earth Observing System Data and Information
+System (EOSDIS), NASA's system for managing and distributing Earth science data.
+"""
 
 from __future__ import annotations
 
@@ -25,14 +30,21 @@ class CatalogError(RuntimeError):
     """A catalog request failed or returned an unexpected response."""
 
 
-def build_collection_request(short_name: str | None) -> Request:
-    """Build a request for at most one EOSDIS collection.
+def build_eosdis_collection_request(short_name: str | None) -> Request:
+    """Create a CMR catalog request filtered to one EOSDIS collection.
+
+    The ``gov.nasa.eosdis`` tag selects collections in NASA's Earth Observing
+    System Data and Information System. A collection describes a dataset and
+    version, such as ATL03 version 007. The returned request is ready to pass to
+    ``fetch_first_cmr_collection``.
 
     Args:
-        short_name: Optional exact product short name, such as ATL03.
+        short_name: Optional product identifier, such as ATL03. When omitted,
+            CMR chooses the first collection from the tagged catalog.
 
     Returns:
-        A public CMR request with a page size of one and no pagination.
+        An HTTP request with the EOSDIS tag, a page size of one, and the supplied
+        product filter.
     """
 
     query_parameters = {"tag_key": "gov.nasa.eosdis", "page_size": "1"}
@@ -48,23 +60,28 @@ def build_collection_request(short_name: str | None) -> Request:
     )
 
 
-def fetch_first_collection(
+def fetch_first_cmr_collection(
     collection_request: Request,
     timeout_seconds: float,
     ca_bundle_path: str | None,
 ) -> dict[str, Any] | None:
-    """Fetch one collection using a verified TLS connection.
+    """Send a catalog request to CMR and return its first collection record.
+
+    Decode the response and check that the record contains the collection ID,
+    short name, and title needed to display a product preview.
 
     Args:
-        collection_request: Request produced by build_collection_request.
-        timeout_seconds: Socket connection/read timeout, not a total deadline.
-        ca_bundle_path: Optional PEM bundle; defaults to SSL_CERT_FILE or Certifi.
+        collection_request: Catalog request from build_eosdis_collection_request.
+        timeout_seconds: Maximum wait for each socket connection or read operation.
+        ca_bundle_path: Optional file of trusted certificate authorities for the
+            HTTPS connection. Defaults to SSL_CERT_FILE or Certifi's bundle.
 
     Returns:
         The first collection record, or None when no collections match.
 
     Raises:
-        CatalogError: If TLS, transport, JSON decoding, or response validation fails.
+        CatalogError: If the connection fails, CMR reports a timeout or HTTP error,
+            or the response lacks valid collection metadata.
     """
 
     resolved_ca_bundle = (
@@ -108,14 +125,21 @@ def fetch_first_collection(
     return first_collection
 
 
-def summarize_collection(collection_record: dict[str, Any]) -> dict[str, Any]:
-    """Extract source-backed candidate terms without inventing file patterns.
+def build_product_search_term_preview(collection_record: dict[str, Any]) -> dict[str, Any]:
+    """Prepare a product preview with identifiers that can be searched in code.
+
+    Select the collection's name, version, provider, description, and identifiers
+    for display by ``nasa-product-preview``. The short name, collection entry ID,
+    and concept ID become candidate search terms. Repeated terms appear once;
+    each term records its original metadata field and starts as unreviewed.
 
     Args:
-        collection_record: A validated CMR collection entry.
+        collection_record: CMR record from fetch_first_cmr_collection, containing
+            at least title, short_name, and id.
 
     Returns:
-        Product metadata and candidate literal terms with their source fields.
+        A dictionary containing product metadata and a candidate_signatures list.
+        Each candidate has a term, source_field, and review_status.
     """
 
     candidate_signatures = []
@@ -137,12 +161,17 @@ def summarize_collection(collection_record: dict[str, Any]) -> dict[str, Any]:
         "concept_id": collection_record["id"],
         "summary": collection_record.get("summary"),
         "candidate_signatures": candidate_signatures,
-        "note": "Literal metadata terms; code usage and filename patterns are unverified.",
+        "note": "Candidate search terms extracted from CMR collection identifiers.",
     }
 
 
 def main(argument_values: list[str] | None = None) -> int:
-    """Print one CMR collection preview and exit.
+    """Run the nasa-product-preview command to inspect a NASA catalog entry.
+
+    Parse the product filter and connection options, fetch a collection from
+    CMR, and print its metadata and candidate code-search terms as formatted JSON
+    to standard output. Progress and errors go to standard error. The returned
+    status becomes the command's exit code.
 
     Args:
         argument_values: Arguments without the executable name; defaults to sys.argv.
@@ -154,7 +183,7 @@ def main(argument_values: list[str] | None = None) -> int:
 
     argument_parser = argparse.ArgumentParser(
         prog="nasa-product-preview",
-        description="Fetch one EOSDIS collection from NASA CMR and then exit.",
+        description="Look up a NASA data collection and display its code-search identifiers.",
     )
     argument_parser.add_argument("--short-name", help="optional product, e.g. ATL03")
     argument_parser.add_argument(
@@ -172,11 +201,11 @@ def main(argument_values: list[str] | None = None) -> int:
         if not parsed_arguments.short_name:
             argument_parser.error("--short-name must not be blank")
 
-    collection_request = build_collection_request(parsed_arguments.short_name)
+    collection_request = build_eosdis_collection_request(parsed_arguments.short_name)
     started_at = time.monotonic()
     print("Contacting NASA CMR for one collection...", file=sys.stderr, flush=True)
     try:
-        collection_record = fetch_first_collection(
+        collection_record = fetch_first_cmr_collection(
             collection_request, parsed_arguments.timeout, parsed_arguments.ca_bundle,
         )
         if collection_record is None:
@@ -185,7 +214,7 @@ def main(argument_values: list[str] | None = None) -> int:
         result_record = {
             "source_url": collection_request.full_url,
             "retrieved_at": datetime.now(timezone.utc).isoformat(),
-            "collection": summarize_collection(collection_record),
+            "collection": build_product_search_term_preview(collection_record),
         }
         print(json.dumps(result_record, indent=2, ensure_ascii=True))
         print(

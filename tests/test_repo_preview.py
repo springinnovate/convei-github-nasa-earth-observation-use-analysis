@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from nasa_eo_search.repo_preview import (
-    build_repository_query, first_content_match, main, summarize_repository_match,
+    build_sourcegraph_product_query, read_first_content_match, main, format_repository_match,
 )
 from nasa_eo_search.sourcegraph import ServerSentEvent, SourcegraphProtocolError
 
@@ -28,7 +28,7 @@ class RepositoryPreviewTests(unittest.TestCase):
         """Escape regex and query syntax in the user-supplied phrase."""
 
         search_phrase = 'ATL03 "quoted" \\ repo:elsewhere'
-        search_query = build_repository_query(search_phrase, False)
+        search_query = build_sourcegraph_product_query(search_phrase, False)
         decoded_pattern = search_query.split('content:', 1)[1].rsplit(' count:', 1)[0]
         self.assertNotIn(' ', decoded_pattern)
         self.assertNotIn('"', decoded_pattern)
@@ -43,12 +43,12 @@ class RepositoryPreviewTests(unittest.TestCase):
         self.assertIn(r'repo:^github\.com/', search_query)
         self.assertIn('visibility:public', search_query)
         self.assertIn('count:1 timeout:15s', search_query)
-        self.assertNotIn('repo:', build_repository_query('ATL03', True))
+        self.assertNotIn('repo:', build_sourcegraph_product_query('ATL03', True))
 
     def test_product_boundaries_reject_substrings_and_keep_filenames(self) -> None:
         """Reject MATL03 and suffix collisions while retaining product tokens."""
 
-        search_query = build_repository_query("ATL03", False)
+        search_query = build_sourcegraph_product_query("ATL03", False)
         encoded_pattern = search_query.split('content:', 1)[1].rsplit(' count:', 1)[0]
         search_pattern = re.compile(encoded_pattern, re.IGNORECASE)
         for file_contents in (
@@ -66,7 +66,7 @@ class RepositoryPreviewTests(unittest.TestCase):
     def test_domain_punctuation_remains_literal(self) -> None:
         """Do not allow regex dots to turn a domain into wildcard matches."""
 
-        search_query = build_repository_query("earthdata.nasa.gov", False)
+        search_query = build_sourcegraph_product_query("earthdata.nasa.gov", False)
         encoded_pattern = search_query.split('content:', 1)[1].rsplit(' count:', 1)[0]
         search_pattern = re.compile(encoded_pattern, re.IGNORECASE)
         self.assertIsNotNone(search_pattern.search("https://earthdata.nasa.gov/"))
@@ -106,7 +106,7 @@ class RepositoryPreviewTests(unittest.TestCase):
     def test_match_has_clickable_file_and_one_based_lines(self) -> None:
         """Preserve the indexed revision and convert code lines for human readers."""
 
-        match_summary = summarize_repository_match(EXAMPLE_MATCH)
+        match_summary = format_repository_match(EXAMPLE_MATCH)
         self.assertEqual(match_summary["matching_lines"][0]["line_number"], 5)
         self.assertEqual(match_summary["file_url"],
                          "https://github.com/example/project/blob/abc123/read%20data.py")
@@ -120,15 +120,47 @@ class RepositoryPreviewTests(unittest.TestCase):
             ServerSentEvent("progress", json.dumps({"skipped": [{"reason": "timeout"}]})),
             ServerSentEvent("done", "{}"),
         ]
-        self.assertIsNone(first_content_match(search_events, diagnostics_output))
+        self.assertIsNone(read_first_content_match(search_events, diagnostics_output))
         self.assertIn("timeout", diagnostics_output.getvalue())
+
+    def test_formatting_invalid_match_fields_raises_value_error(self) -> None:
+        """Reject missing, empty, and non-string repository or path values."""
+
+        for field_name in ("repository", "path"):
+            for invalid_value in (None, "", " ", 42):
+                with self.subTest(field_name=field_name, invalid_value=invalid_value):
+                    content_match = {**EXAMPLE_MATCH, field_name: invalid_value}
+                    with self.assertRaisesRegex(ValueError, field_name):
+                        format_repository_match(content_match)
+            content_match = dict(EXAMPLE_MATCH)
+            del content_match[field_name]
+            with self.assertRaisesRegex(ValueError, field_name):
+                format_repository_match(content_match)
+
+    def test_invalid_match_reports_command_error_and_closes_stream(self) -> None:
+        """Print an invalid-field error and exit with status one."""
+
+        search_events = (
+            event for event in [ServerSentEvent("matches", '[{"type":"content"}]')]
+        )
+        results_output = StringIO()
+        diagnostics_output = StringIO()
+        with (
+            patch("nasa_eo_search.repo_preview.stream_sourcegraph_search_events",
+                  return_value=search_events),
+            redirect_stdout(results_output), redirect_stderr(diagnostics_output),
+        ):
+            self.assertEqual(main(["ATL03"]), 1)
+        self.assertEqual(results_output.getvalue(), "")
+        self.assertIn("Match repository must be a nonempty string", diagnostics_output.getvalue())
+        self.assertIsNone(search_events.gi_frame)
 
     def test_incomplete_and_invalid_streams_fail(self) -> None:
         """Do not interpret broken or malformed responses as empty search results."""
 
         for search_events in ([], [ServerSentEvent("matches", "{}")]):
             with self.assertRaises(SourcegraphProtocolError):
-                first_content_match(search_events, StringIO())
+                read_first_content_match(search_events, StringIO())
 
 
 if __name__ == "__main__":
