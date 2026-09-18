@@ -18,6 +18,9 @@ dependencies = [
 
 [project.scripts]
 sourcegraph-search = "nasa_eo_search.sourcegraph:main"
+nasa-product-preview = "nasa_eo_search.cmr:main"
+nasa-repo-preview = "nasa_eo_search.repo_preview:main"
+nasa-repo-search = "nasa_eo_search.repo_search:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
