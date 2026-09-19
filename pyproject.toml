@@ -20,6 +20,7 @@ dependencies = [
 sourcegraph-search = "nasa_eo_search.sourcegraph:main"
 nasa-product-preview = "nasa_eo_search.cmr:main"
 nasa-catalog-collect = "nasa_eo_search.catalog:main"
+nasa-catalog-export = "nasa_eo_search.catalog_csv:main"
 nasa-repo-preview = "nasa_eo_search.repo_preview:main"
 nasa-repo-search = "nasa_eo_search.repo_search:main"
 
