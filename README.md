@@ -178,6 +178,91 @@ Check `summary.json` after a search:
 
 The search timeout is 60 seconds; a connection or read can wait up to 65 seconds.
 
+## Search a selected group of products
+
+Create a CSV containing the products you want to search. Use the exact `provider`
+and `short_name` values from your catalog. For example, save this as `pilot.csv`:
+
+```csv
+provider,short_name,search_term
+NSIDC_CPRD,ATL03,ATL03
+NSIDC_CPRD,ATL06,ATL06
+```
+
+`search_term` is optional and defaults to the product's short name. Each term must
+be one of that product's catalog candidates. You can also save selected rows from
+the catalog export as a new CSV: extra columns are accepted. Add `search_term`
+to choose an identifier other than the short name. Selecting a term records your
+choice in the batch plan and preserves its catalog review status and sources.
+
+Start the batch:
+
+```console
+nasa-repo-batch start nasa-catalog --selection pilot.csv --output pilot-search
+```
+
+The command validates the whole selection before searching. It defaults to at
+most 20 distinct terms; use `--max-searches 50` to allow a larger selection.
+Identical terms shared by products are searched once and linked to each selected
+product. Searches run sequentially with a one-second pause between requests.
+Progress shows the query number, term, attempt, and saved match counts.
+
+The search covers public GitHub content in Sourcegraph's index, including forks
+and archives. Add `--all-hosts` when starting a batch to include other indexed
+public code hosts. Each query has the same timeouts and term matching as
+`nasa-repo-search`. Inspect the matched code to establish product use.
+
+### Inspect batch results
+
+| File | Contents |
+| --- | --- |
+| `plan.json` | Selected terms, associated products and catalog sources, query scope, and source catalog status. |
+| `searches.csv` | One row per product/query with the latest attempt's status, match count, warnings, and errors. Includes searches with zero matches. |
+| `matches.csv` | Product-linked file matches, repository/owner, stars when available, file type, language, revision, matching text, and GitHub file links. |
+| `summary.json` | Batch status, counts by query status, and CSV row counts. |
+| `searches/<search-id>/attempt-000001/` | Original `matches.jsonl`, `events.jsonl`, and `summary.json` for each attempt. |
+
+Reports refresh after each query; save a copy if you add your own review notes.
+`matches.csv` retains matches from all attempts;
+filter `latest_attempt` to `true` for the current results. Use `attempt_status` to
+distinguish completed searches from partial results. Matching text includes
+one-based line numbers. Multiple product associations and repeated attempts can
+produce multiple rows for the same file. CSV fields use the same text protection
+as the catalog export.
+
+### Stop and resume
+
+Press Ctrl+C to stop. Resume using the saved batch directory:
+
+```console
+nasa-repo-batch resume pilot-search
+```
+
+Resume uses `plan.json`, so the original catalog and selection CSV can be moved
+after the batch starts. Verified completed searches are skipped. Pending,
+incomplete, failed, or interrupted queries are searched again from the beginning,
+once per resume, in new attempt directories. Earlier attempts remain available.
+To change the selected terms or scope, start a new batch directory.
+
+| Search status | Meaning |
+| --- | --- |
+| `pending` | The query has not started. |
+| `finished_no_reported_limits` | Sourcegraph reported completion with no warnings, and saved evidence passed validation. |
+| `incomplete` | Sourcegraph reported limits or ended before confirming completion. |
+| `failed` | A request/file error occurred, or saved evidence was missing or damaged. See `error` in `searches.csv`. |
+| `interrupted` | The search was stopped, or its previous process exited before finalizing the attempt. |
+
+Batch exit codes are 0 when all queries completed, 4 for incomplete results,
+1 for input/file errors or failed queries, and 130 for interruption. Check the
+terminal and `summary.json` after each run. A file-writing failure can leave the
+previous report snapshot in place. Close a CSV in your spreadsheet application
+if it prevents a report from being updated, then resume the batch.
+
+One process can run in a batch directory at a time. `batch.lock` is released by
+the operating system when the process exits; the file stays in place for reuse.
+Both subcommands accept `--ca-bundle PATH`; Sourcegraph authentication uses
+`SOURCEGRAPH_TOKEN` as described below.
+
 ## Preview one repository match
 
 Display the first matching file:
@@ -254,6 +339,7 @@ Use these module names with `python -m`, followed by the same command arguments:
 | `nasa-catalog-collect` | `nasa_eo_search.catalog` |
 | `nasa-catalog-export` | `nasa_eo_search.catalog_csv` |
 | `nasa-repo-search` | `nasa_eo_search.repo_search` |
+| `nasa-repo-batch` | `nasa_eo_search.repo_batch` |
 | `nasa-repo-preview` | `nasa_eo_search.repo_preview` |
 | `nasa-product-preview` | `nasa_eo_search.cmr` |
 | `sourcegraph-search` | `nasa_eo_search.sourcegraph` |
