@@ -72,6 +72,63 @@ Coverage is the public EOSDIS-tagged CMR catalog at retrieval time, with an
 optional short-name filter. CMR is a live catalog: records can change during a
 run. The command follows NASA's [Search After pagination](https://cmr.earthdata.nasa.gov/search/site/docs/search/api.html#search-after).
 
+## Export the catalog to CSV
+
+Create a spreadsheet-readable table from a saved catalog:
+
+```console
+nasa-catalog-export nasa-catalog --output nasa-products.csv
+```
+
+The command reads `products.jsonl` and `summary.json` from the catalog directory.
+Choose a new output filename in an existing directory. Each product becomes one
+CSV row; the terminal reports the exported count and the source catalog status.
+
+Open the CSV in your spreadsheet application. In Excel, use **Data → From
+Text/CSV**, select UTF-8 and a comma delimiter, and import identifiers such as
+`short_name` as Text to preserve their spelling. Enable Wrap Text to view the
+multiline cells.
+
+The columns include:
+
+- `provider`, `short_name`, and `collection_count` for filtering products.
+- `collection_titles`, `collection_descriptions`, `collection_versions`,
+  `collection_concept_ids`, and `collection_entry_ids`. Entries are numbered
+  `[1]`, `[2]`, and so on in the original collection order. The same number refers
+  to the same collection across these columns. A numbered blank means the value
+  was absent from the catalog.
+- `candidate_search_terms`, `candidate_review_statuses`, and `candidate_sources`.
+  These use their own shared numbering. Each source identifies the collection
+  concept ID and metadata field that supplied that term.
+- `source_catalog_directory` and the `catalog_*` columns for source status,
+  scope, request URL, run times, warnings, and errors.
+
+Incomplete, failed, and interrupted catalogs can be exported when their saved
+product count matches the file. Their status is printed as a warning and included
+in every row. Wait for a `running` catalog to finish before exporting. A completed
+empty catalog produces a header-only CSV, with its status reported in the terminal.
+
+CSV fields are quoted, and Unicode, commas, quotation marks, and embedded newlines
+are preserved. Formula-like cells receive a visible `Text: ` prefix to keep them
+ordinary text; the original values remain in the JSON files. This addresses the
+[formula-prefix risk described by OWASP](https://community.owasp.org/attacks/CSV_Injection).
+Review spreadsheet import settings when moving the file between applications.
+The exporter warns if a cell exceeds Excel's
+[32,767-character limit](https://support.microsoft.com/en-us/excel/excel-specifications-and-limits)
+and retains the complete text in the CSV.
+
+Exit code 0 means export succeeded, including an export of a partial catalog.
+Exit code 1 means invalid catalog data or a file error; 130 means interruption.
+Validation finishes before the CSV is created. A write failure or interruption
+removes the newly created partial export when the file system permits cleanup.
+Existing output files and source catalog files are preserved.
+
+The module equivalent is:
+
+```console
+python -m nasa_eo_search.catalog_csv nasa-catalog --output nasa-products.csv
+```
+
 ## Collect repository matches
 
 Search for a product identifier and save the results:
