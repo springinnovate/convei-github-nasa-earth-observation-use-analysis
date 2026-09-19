@@ -1,7 +1,7 @@
 # NASA data references in public code
 
-Command-line tools for finding NASA product references in public repositories
-through Sourcegraph and looking up product identifiers in NASA's catalog.
+Collect NASA product names and identifiers, export them to a spreadsheet, and
+search public code for references to a product using Sourcegraph.
 
 ## Install
 
@@ -12,6 +12,25 @@ python -m pip install -e .
 ```
 
 Run this command again after pulling changes that add command-line tools.
+
+## Start here
+
+Collect the catalog and export it for review:
+
+```console
+nasa-catalog-collect --output nasa-catalog
+nasa-catalog-export nasa-catalog --output nasa-products.csv
+```
+
+Open `nasa-products.csv` in a spreadsheet to inspect products and their candidate
+search terms. To search for a term you have selected, run:
+
+```console
+nasa-repo-search ATL03 --output atl03-search
+```
+
+Use a new output directory or CSV filename for each run. Run any command with
+`--help` to see its options.
 
 ## Collect the NASA product catalog
 
@@ -31,16 +50,11 @@ and prints the collection and product counts as it runs.
 | `products.jsonl` | One product per provider and exact short name, with its collection versions, titles, descriptions, identifiers, and candidate search terms. Written when collection ends. |
 | `summary.json` | Catalog scope, request URL, timestamps, reported totals, saved counts, warnings, and run status. |
 
-JSON Lines (`.jsonl`) files contain one JSON object per line. In `products.jsonl`,
-`collections` preserves the details of each version. `candidate_signatures`
-contains terms drawn from short names, entry IDs, and collection concept IDs.
-Each term has a `sources` list naming the collection and metadata field it came
-from, plus a `review_status` of `unreviewed`.
-
-Versions sharing the same provider and exact short name are grouped together;
-identical search terms appear once within that group. Names from different
-providers remain separate. Review the terms for ambiguity before using them in
-repository searches, for example `nasa-repo-search ATL03 --output atl03-search`.
+JSON Lines (`.jsonl`) files contain one JSON object per line. A collection is a
+dataset version. Collections with the same provider and exact short name are
+grouped into one product. Each product includes candidate search terms drawn
+from its identifiers, with the source of each term recorded. Terms start with
+the review status `unreviewed`; inspect them for ambiguity before searching.
 
 For a small trial run, filter to one product and request one record per page:
 
@@ -50,27 +64,25 @@ nasa-catalog-collect --short-name ATL03 --page-size 1 --output catalog-atl03
 
 `--page-size` accepts 1–2000 records (default: 500). `--timeout` sets the socket
 connection/read timeout in seconds (default: 30). `--ca-bundle` uses the
-certificate settings described below. All commands can also be launched as a
-module: `python -m nasa_eo_search.catalog --output nasa-catalog`.
+certificate settings described below.
 
 Check `summary.json` before using the catalog:
 
 | Status | Meaning | Exit code |
 | --- | --- | --- |
-| `complete` | Pagination ended, reported totals stayed consistent, and the unique collection count matches the reported total. An empty result is also complete. | 0 |
-| `incomplete` | Counts changed or disagreed, records repeated, or a pagination cursor repeated. See `warnings`. | 4 |
+| `complete` | Collection finished and the saved count matches NASA's reported total. | 0 |
+| `incomplete` | Counts or page results were inconsistent. See `warnings`. | 4 |
 | `failed` | A request, response, or output-file error stopped the run. See `error`. | 1 |
 | `interrupted` | Collection was interrupted with Ctrl+C. | 130 |
 | `running` | Collection is active, or the process stopped before recording a final status. | — |
 
-On a request failure or Ctrl+C, previously collected records and product groups
-are retained. Rerun in a new directory to collect a fresh catalog. A file-system
-failure may also prevent output files or the final summary from being written;
-the command reports that error in the terminal.
+After a connection failure or Ctrl+C, you can inspect the results saved so far.
+Rerun in a new directory to collect a fresh catalog. Check terminal errors as
+well as `summary.json`, especially after a file-writing failure.
 
 Coverage is the public EOSDIS-tagged CMR catalog at retrieval time, with an
-optional short-name filter. CMR is a live catalog: records can change during a
-run. The command follows NASA's [Search After pagination](https://cmr.earthdata.nasa.gov/search/site/docs/search/api.html#search-after).
+optional short-name filter. Records can change during collection; check the run
+status before using the results.
 
 ## Export the catalog to CSV
 
@@ -103,31 +115,20 @@ The columns include:
 - `source_catalog_directory` and the `catalog_*` columns for source status,
   scope, request URL, run times, warnings, and errors.
 
-Incomplete, failed, and interrupted catalogs can be exported when their saved
-product count matches the file. Their status is printed as a warning and included
-in every row. Wait for a `running` catalog to finish before exporting. A completed
-empty catalog produces a header-only CSV, with its status reported in the terminal.
+Check `catalog_status` when reviewing the CSV. Exports of incomplete, failed, or
+interrupted catalogs contain the products saved so far and carry a warning.
+Wait for a `running` catalog to finish before exporting. An empty catalog
+produces a CSV containing only column headings.
 
-CSV fields are quoted, and Unicode, commas, quotation marks, and embedded newlines
-are preserved. Formula-like cells receive a visible `Text: ` prefix to keep them
-ordinary text; the original values remain in the JSON files. This addresses the
-[formula-prefix risk described by OWASP](https://community.owasp.org/attacks/CSV_Injection).
-Review spreadsheet import settings when moving the file between applications.
-The exporter warns if a cell exceeds Excel's
-[32,767-character limit](https://support.microsoft.com/en-us/excel/excel-specifications-and-limits)
-and retains the complete text in the CSV.
+Some values have a visible `Text: ` prefix so spreadsheets treat them as text.
+The original values are in `products.jsonl`. If the exporter reports a cell-size
+warning, consult that file for the full value if your spreadsheet truncates it.
 
 Exit code 0 means export succeeded, including an export of a partial catalog.
 Exit code 1 means invalid catalog data or a file error; 130 means interruption.
-Validation finishes before the CSV is created. A write failure or interruption
-removes the newly created partial export when the file system permits cleanup.
-Existing output files and source catalog files are preserved.
-
-The module equivalent is:
-
-```console
-python -m nasa_eo_search.catalog_csv nasa-catalog --output nasa-products.csv
-```
+For a count-mismatch or invalid-data error, check the source catalog's
+`summary.json` and `products.jsonl`. For a file error, check the destination
+directory and choose an unused output filename.
 
 ## Collect repository matches
 
@@ -160,9 +161,8 @@ separators such as spaces, quotes, underscores, dots, slashes, and hyphens.
 For example, `ATL03` matches `ATL03_007`, `ATL03.h5`, and `test_atl03`.
 Punctuation within the search phrase is treated literally.
 
-The command requests all results using Sourcegraph's `count:all` option. Coverage
-and completion apply to Sourcegraph's indexed content. A matching reference
-needs review in its code context to determine how the product is used.
+The command collects the results returned by Sourcegraph for its indexed
+content. Follow the matching files to see how each product is used.
 
 ### Run status
 
@@ -170,14 +170,13 @@ Check `summary.json` after a search:
 
 | Status | Meaning | Exit code |
 | --- | --- | --- |
-| `finished_no_reported_limits` | Sourcegraph sent final progress and completion messages with an empty warning list. | 0 |
-| `incomplete` | The run received warnings or ended before both completion messages arrived. Inspect `events.jsonl`. | 4 |
+| `finished_no_reported_limits` | Sourcegraph reported completion with no search-limit warnings. | 0 |
+| `incomplete` | The search returned warnings or ended before reporting completion. Inspect `events.jsonl`. | 4 |
 | `failed` | A connection, response, or file error stopped collection. Previously saved matches remain available. | 1 |
 | `interrupted` | The search was interrupted with Ctrl+C. Previously saved matches remain available. | 130 |
 | `running` | Collection is active, or the process stopped before writing its final summary. | — |
 
-Server warnings are retained throughout the run. The server search timeout is
-60 seconds; the socket timeout allows 65 seconds for a connection or read.
+The search timeout is 60 seconds; a connection or read can wait up to 65 seconds.
 
 ## Preview one repository match
 
@@ -191,7 +190,7 @@ nasa-repo-preview "earthdata.nasa.gov" --all-hosts
 The JSON output includes the repository URL, stars when available, file path,
 language, commit, and matching lines. GitHub matches include a link to the file
 at the reported revision. The command exits after the first file arrives.
-Its default scope excludes forks and archived repositories.
+Its default scope is active, non-fork public repositories in Sourcegraph's index.
 
 Save the preview by redirecting standard output:
 
@@ -234,7 +233,6 @@ for available filters.
 
 ## Connection settings
 
-The public services used by these commands accept unauthenticated requests.
 For Sourcegraph authentication, set `SOURCEGRAPH_TOKEN`. The
 `sourcegraph-search` command also accepts `--endpoint` for another instance.
 
@@ -249,13 +247,13 @@ environment, for example:
 python -m nasa_eo_search.repo_search ATL03 --output atl03-search
 ```
 
-The other modules are `nasa_eo_search.repo_preview`, `nasa_eo_search.cmr`, and
-`nasa_eo_search.sourcegraph`. Run any command with `--help` for its options.
+Use these module names with `python -m`, followed by the same command arguments:
 
-## Tests
-
-```console
-python -m unittest discover -s tests -v
-```
-
-The tests use recorded responses and mock network connections.
+| Command | Module |
+| --- | --- |
+| `nasa-catalog-collect` | `nasa_eo_search.catalog` |
+| `nasa-catalog-export` | `nasa_eo_search.catalog_csv` |
+| `nasa-repo-search` | `nasa_eo_search.repo_search` |
+| `nasa-repo-preview` | `nasa_eo_search.repo_preview` |
+| `nasa-product-preview` | `nasa_eo_search.cmr` |
+| `sourcegraph-search` | `nasa_eo_search.sourcegraph` |
