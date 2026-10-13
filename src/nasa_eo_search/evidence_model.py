@@ -82,7 +82,7 @@ def request_evidence_classification(
 
     Args:
         request_body: Structured classification request, without credentials.
-        api_key: Credential supplied by OPENAI_API_KEY only.
+        api_key: Credential loaded from the selected key file or OPENAI_API_KEY.
         ca_bundle_path: Optional certificate authority bundle.
 
     Returns:

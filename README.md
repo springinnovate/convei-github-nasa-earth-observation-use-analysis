@@ -320,23 +320,36 @@ maximum generated tokens for the next invocation. It makes no API calls, needs
 no key, and does not change the prepared files. The byte count is not a token or
 price estimate; API cost depends on the selected model and actual token usage.
 
-Set `OPENAI_API_KEY` in the terminal environment. For Git Bash, enter it without
-displaying it or putting its value in a shell command:
+Create `secrets/openai.key` in the directory where you run the command. Save
+**only your raw API key** in this UTF-8 text file: one line, without quotes,
+JSON, or an `OPENAI_API_KEY=` prefix. A trailing newline is accepted. No
+environment variable is required. To choose a different location explicitly:
 
-```bash
-read -rsp "OpenAI API key: " OPENAI_API_KEY
-export OPENAI_API_KEY
+```console
+nasa-evidence-classify run pilot-review --model YOUR_MODEL --api-key-file ./secrets/openai.key --max-requests 5
 ```
 
-For PowerShell:
+Credentials are checked in this order:
 
-```powershell
-$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new('', (Read-Host 'OpenAI API key' -AsSecureString)).Password
-```
+1. The file selected with `--api-key-file PATH`.
+2. A nonblank `OPENAI_API_KEY` environment variable, when no file is selected.
+3. `./secrets/openai.key`, relative to the current working directory.
 
-Keep the key out of project files and version control. Running classification
-sends the prepared public-code excerpts and NASA metadata to OpenAI. The
-credential is sent only to the OpenAI endpoint and is not written to receipts.
+An explicitly selected file must be readable and valid; the command reports an
+error instead of falling back to another credential. Files may contain at most
+4096 bytes. Preparation, `--dry-run`, and fully cached runs do not read the key.
+Key contents and the selected file path are not saved in plans or request receipts,
+so you can change the credential location when resuming.
+
+The repository ignores `secrets/`, `secretes/`, and `*.key` files in Git. The
+file is still plaintext: restrict access to your account, keep it out of shared
+folders, and never commit or paste the key into logs or issues. For a custom
+filename outside those ignored paths, add your own ignore rule. Git ignore rules
+do not protect files that were already tracked.
+
+Running classification sends the prepared public-code excerpts and NASA metadata
+to OpenAI. The credential is sent only to the OpenAI endpoint and is not written
+to receipts.
 Requests use `store: false`; inspect your API project's data settings as well.
 
 ### Run and resume classification

@@ -6,3 +6,6 @@ dist/
 build/
 *.jsonl
 search-results/
+secrets/
+secretes/
+*.key

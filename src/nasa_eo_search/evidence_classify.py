@@ -2,13 +2,13 @@
 
 import argparse
 from datetime import datetime, timezone
-import os
 from pathlib import Path
 import sys
 from typing import Any
 
 from nasa_eo_search.batch_files import lock_batch_directory
 from nasa_eo_search.evidence_context import build_evidence_packets, enrich_evidence_group
+from nasa_eo_search.evidence_credentials import load_openai_api_key
 from nasa_eo_search.evidence_inputs import identify_evidence, read_evidence_json, read_product_evidence_groups, serialize_evidence
 from nasa_eo_search.evidence_model import (
     CLASSIFICATION_PROMPT, PROMPT_VERSION, build_classification_request,
@@ -141,9 +141,7 @@ def run_prepared_classifications(arguments: argparse.Namespace) -> int:
           file=sys.stderr, flush=True)
     if arguments.dry_run:
         return 0
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if selected_requests and not api_key:
-        raise ValueError("Set OPENAI_API_KEY in your environment before running, or use --dry-run.")
+    api_key = load_openai_api_key(arguments.api_key_file) if selected_requests else ""
     if selected_requests:
         build_tls_context(arguments.ca_bundle)
     interrupted = False
@@ -218,6 +216,10 @@ def main(argument_values: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="classify or resume a prepared evidence directory")
     run.add_argument("output", type=Path)
     run.add_argument("--model", required=True, help="OpenAI model supporting Responses structured outputs")
+    run.add_argument(
+        "--api-key-file", type=Path,
+        help="read the raw key from this file; otherwise use OPENAI_API_KEY, then ./secrets/openai.key",
+    )
     run.add_argument("--max-requests", type=int, default=20, help="new API-call limit for this invocation (default: 20)")
     run.add_argument("--max-output-tokens", type=int, default=2048, help="generated-token cap per call (default: 2048)")
     run.add_argument("--dry-run", action="store_true", help="preview work without credentials, API calls, or output writes")

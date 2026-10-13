@@ -355,6 +355,17 @@ class EvidenceModelTests(unittest.TestCase):
 class EvidenceRunnerTests(unittest.TestCase):
     """Exercise paid-call bounds and durable restart using mocked responses."""
 
+    def setUp(self) -> None:
+        """Keep runner tests from reading any user-owned default credential file."""
+        credential_directory = TemporaryDirectory()
+        self.addCleanup(credential_directory.cleanup)
+        default_key_patch = patch(
+            "nasa_eo_search.evidence_credentials.DEFAULT_OPENAI_KEY_FILE",
+            Path(credential_directory.name) / "missing.key",
+        )
+        default_key_patch.start()
+        self.addCleanup(default_key_patch.stop)
+
     def test_dry_run_needs_no_key_network_or_output_writes(self) -> None:
         """Preview requests without touching evidence files or requiring credentials."""
         with TemporaryDirectory() as directory:
