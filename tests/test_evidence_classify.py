@@ -87,7 +87,8 @@ def make_model_response(request_body: dict, api_key: str = "unused", ca_bundle_p
     """
     packet = json.loads(request_body["input"])
     classification = {"category": "supporting_software", "explanation": "Tests demonstrate product support.",
-                      "evidence_ids": [packet["evidence"][0]["evidence_id"]], "needs_review": False}
+                      "evidence_ids": [packet["evidence"][0]["evidence_id"]], "needs_review": False,
+                      "evidence_types": ["test"], "observed_versions": [], "review_reasons": []}
     return {"status": "completed", "model": "test-model-snapshot", "id": "resp_test",
             "usage": {"input_tokens": 100, "output_tokens": 30},
             "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(classification)}]}]}
@@ -209,8 +210,10 @@ class EvidencePreparationTests(unittest.TestCase):
             self.assertTrue(all(len(serialize_evidence(packet).encode("utf-8")) <= 4096 for packet in packets))
             self.assertEqual("".join(item["text"] for packet in packets for item in packet["evidence"]), large_text)
             group["product"]["collections"][0]["summary"] = "x" * 5000
-            with self.assertRaises(ValueError):
-                build_evidence_packets(group, 4096)
+            compact_packets = build_evidence_packets(group, 4096)
+            self.assertTrue(all(len(serialize_evidence(packet).encode("utf-8")) <= 4096 for packet in compact_packets))
+            self.assertEqual(group["product"]["collections"][0]["summary"], "x" * 5000)
+            self.assertTrue(group["packaging_notes"])
 
     def test_raw_urls_reject_other_hosts_traversal_and_moving_revisions(self) -> None:
         """Construct only commit-pinned raw GitHub URLs, regardless of source URLs."""
@@ -226,8 +229,8 @@ class EvidencePreparationTests(unittest.TestCase):
         self.assertIn("a%20file.py", build_public_file_url("github.com/a/b", "a" * 40, "a file.py"))
         self.assertIsNone(RejectEvidenceRedirects().redirect_request(None, None, 302, "redirect", {}, "http://localhost"))
 
-    def test_locked_source_and_oversized_metadata_are_explicit(self) -> None:
-        """Reject active source writers and retain oversized evidence as blocked."""
+    def test_locked_source_and_shortened_metadata_are_explicit(self) -> None:
+        """Reject active source writers and preserve full metadata behind compact inputs."""
         with TemporaryDirectory() as directory:
             root = Path(directory)
             batch, catalog = create_saved_evidence_inputs(root)
@@ -239,12 +242,13 @@ class EvidencePreparationTests(unittest.TestCase):
             products[0]["collections"][0]["summary"] = "long description " * 1000
             (catalog / "products.jsonl").write_text("\n".join(json.dumps(product) for product in products))
             with redirect_stderr(StringIO()):
-                self.assertEqual(main(arguments), 4)
+                self.assertEqual(main(arguments), 0)
             summary = read_evidence_json(root / "evidence" / "summary.json")
-            self.assertEqual(summary["groups_by_status"]["blocked"], 1)
+            self.assertEqual(summary["groups_by_status"]["blocked"], 0)
             saved_group = read_evidence_json(root / "evidence" / "plan.json")["data"]["groups"][0]
             self.assertEqual(saved_group["product"]["collections"][0]["summary"], products[0]["collections"][0]["summary"])
             self.assertTrue(saved_group["evidence"])
+            self.assertTrue(saved_group["packaging_notes"])
 
     def test_zero_matches_and_matches_without_lines_remain_distinct(self) -> None:
         """Report zero repository groups separately from a blocked empty-line hit."""
@@ -306,7 +310,9 @@ class EvidenceModelTests(unittest.TestCase):
     def test_invalid_categories_citations_and_missing_fields_are_rejected(self) -> None:
         """Require real supplied citations for every substantive category."""
         packet = {"evidence": [{"evidence_id": "real"}]}
-        valid = {"category": "direct_use", "explanation": "Supported", "evidence_ids": ["real"], "needs_review": False}
+        valid = {"category": "direct_use", "explanation": "Supported", "evidence_ids": ["real"],
+                 "needs_review": False, "evidence_types": ["application_code"],
+                 "observed_versions": [], "review_reasons": []}
         for changes in ({"category": "made_up"}, {"evidence_ids": ["invented"]}, {"evidence_ids": []},
                         {"needs_review": "false"}, {"explanation": ""}, {"extra": 1}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
