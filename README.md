@@ -293,17 +293,44 @@ directory for each preparation. Interrupting preparation leaves the original
 inputs available; run preparation again in a new directory.
 
 Open `pilot-review/review.csv` to inspect the groups and warnings. `plan.json`
-contains the exact evidence and planned request packets. Large groups are split
-into packets of at most 24,000 UTF-8 JSON bytes; matching text is retained,
-including fragments of unusually long lines. The catalog metadata is repeated
-in each packet. For example, five repository/product groups can require more
-than five API calls once code context is included.
+contains the original evidence, readable evidence blocks, and planned requests.
+Nearby code stays together, and notebook source text is decoded into readable
+excerpts with source locations. Identical blocks share their text while retaining
+their source occurrences in the audit data. Repository and product descriptions
+are compact; README background accompanies matches rather than getting its own
+classification request. Any unavailable or omitted context remains explicit.
+
+Groups that fit are sent together. Larger groups are split into packets of at
+most 24,000 UTF-8 JSON bytes, retaining matched text and splitting oversized
+blocks when necessary. Five repository/product groups can still require more
+than five API calls. A request limit counts calls, not CSV rows.
 
 Use `--context-lines 20` to change the surrounding-code window (0–100), or
 `--packet-bytes 48000` to change the evidence packet cap (minimum 4096).
 If the metadata and one fragment cannot fit, that group is marked `blocked`;
 increase the packet cap and prepare a new directory. Packet size is measured in
 bytes, not model tokens, and must fit the selected model's input limits.
+
+### Reuse saved evidence with the current format
+
+New preparations use format 2 and prompt `repository-product-v2`. To rebuild
+inputs from an existing format-1 or format-2 preparation:
+
+```console
+nasa-evidence-classify repack pilot-review --output pilot-review-v2
+nasa-evidence-classify run pilot-review-v2 --model YOUR_MODEL --dry-run
+```
+
+`repack` reads saved excerpts only: it makes no GitHub or OpenAI requests, needs
+no key, and leaves the source directory unchanged. It preserves the original
+catalog and match provenance, but cannot recover code that was never collected.
+Choose a new output directory; `--packet-bytes` sets the same size cap as in
+`prepare`.
+
+Old CSVs and receipts remain available. The current `run` command requires a
+format-2 preparation and will reject format 1 before reading a key or writing
+files. Repacked inputs require new classifications: old paid responses are not
+copied or treated as answers to the changed requests.
 
 ### Preview API work and set your key
 
@@ -362,6 +389,9 @@ nasa-evidence-classify run pilot-review --model YOUR_MODEL --max-requests 5
 
 Repeat the same command to continue. Successful saved responses are validated
 and reused. `--max-requests` limits new calls **per invocation** (default: 20).
+Stopping at that limit can leave assessments pending even when every submitted
+request succeeded. The terminal reports completed and pending assessments;
+check `summary.json` before treating the whole run as finished.
 `--max-output-tokens` caps generated tokens per call, including reasoning tokens
 (default: 2048; allowed: 256–32768). These are request and output-token limits,
 not a dollar budget. The first run fixes the model and output-token cap for that
@@ -394,16 +424,31 @@ Each row in `review.csv` assesses one repository/product pair:
 | `unrelated` | The matching identifier means something else. |
 | `unclear` | Evidence is ambiguous, conflicting, insufficient, or not fully processed. |
 
-The CSV includes an explanation, supporting file/line links, `needs_review`,
-source-search completeness, warnings, and processing status. The model must cite
+The CSV includes one concise conclusion, up to three supporting file/line links,
+evidence types, observed product versions, `needs_review`, and explicit review
+reasons. Source-search completeness, context limitations, warnings, and processing
+status remain separate. Classifications concern the product across versions:
+an ATL03 version 003 example is evidence about ATL03, without establishing
+compatibility with version 007. Observed versions require citations to code or
+documentation excerpts, not just catalog metadata.
+
+The model must cite
 supplied evidence identifiers; those identifiers are checked before accepting a
 response. Check the cited code yourself: a valid citation and a consistent output
 format do not prove that the interpretation is correct or that code was executed.
 
 For split groups, relevant code evidence takes precedence over a prose mention.
 Ambiguous matching evidence or a relevant/unrelated conflict produces `unclear`.
-An unclear packet containing only supplementary context is neutral. Split groups,
-context gaps, partial searches, and ambiguous decisions are flagged for review.
+An unclear packet containing only supplementary context is neutral. Multiple
+packets or a bounded README excerpt alone do not force review. Missing matched
+context, partial searches, conflicting evidence, and model-reported uncertainty
+have explicit review reasons. `reference_only` describes the collected evidence;
+it does not establish that the repository lacks a relevant implementation.
+
+The concise report is assembled from validated packet judgments without an extra
+model call. `audit.json` preserves all packet explanations and citations, including
+qualifications that do not fit in the short CSV conclusion. Check that file when
+reviewing a split or conflicting assessment.
 
 | Processing status | Meaning |
 | --- | --- |
@@ -420,7 +465,8 @@ GitHub repositories were searched or that the model's judgment is correct.
 | File | Contents |
 | --- | --- |
 | `review.csv` | One repository/product row, including blank `human_category` and `human_notes` columns. |
-| `plan.json` | Frozen source metadata, original match provenance, numbered evidence fragments, and request packets. |
+| `plan.json` | Frozen full source metadata, original line evidence and match provenance, compact blocks with source mappings, and request packets. |
+| `audit.json` | Full packet classifications, source citations, review reasons, and evidence limitations for each assessment. |
 | `prompt.json` | Classification instructions and prompt version used by this preparation. |
 | `settings.json` | Model and output-token cap, saved when classification starts. |
 | `requests/<request-hash>/attempt-000001.json` | Credential-free request, timestamps, raw model response when available, validation result, and error. Retries get new numbered files. |
@@ -432,7 +478,7 @@ protection as the catalog export. Original evidence remains in JSON if a spreads
 truncates a large cell. Prepared files are sufficient to resume after the source
 catalog or batch is moved.
 
-Exit code 0 means preparation/preview succeeded or classification processing
+Exit code 0 means preparation/repacking/preview succeeded or classification processing
 completed; 4 means pending or blocked work; 1 means invalid inputs, file errors,
 or failed requests; 130 means interruption. Inspect terminal errors as well as
 `summary.json`, especially if an open spreadsheet prevents report replacement.

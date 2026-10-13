@@ -6,7 +6,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from nasa_eo_search.evidence_inputs import identify_evidence, serialize_evidence
+from nasa_eo_search.evidence_inputs import identify_evidence
+from nasa_eo_search.evidence_notebooks import decode_notebook_source_cells
+from nasa_eo_search.evidence_packaging import package_evidence_blocks
 from nasa_eo_search.sourcegraph import build_tls_context
 
 
@@ -164,6 +166,9 @@ def enrich_evidence_group(
     """
     evidence_by_id = {}
     warnings = group["warnings"]
+    group["notebook_cells"] = []
+    group["notebook_decoded_lines"] = []
+    group["evidence_gaps"] = []
     for file_record in group["files"]:
         evidence = make_line_evidence(file_record, file_record["matching_lines"], "matching_line")
         if offline:
@@ -184,6 +189,39 @@ def enrich_evidence_group(
                 context = [{"line_number": number, "text": source_lines[number - 1]}
                            for number in sorted(selected_numbers - matching_numbers)]
                 evidence.extend(make_line_evidence(file_record, context, "surrounding_code"))
+                if file_record["file"].lower().endswith(".ipynb"):
+                    matching_lines_agree = all(
+                        0 < line["line_number"] <= len(source_lines)
+                        and source_lines[line["line_number"] - 1] == line["text"]
+                        for line in file_record["matching_lines"]
+                    )
+                    if matching_lines_agree:
+                        cells, decoded_lines, gaps = decode_notebook_source_cells(fetched["text"], file_record, evidence)
+                        # Full selected cells may extend beyond the normal hit
+                        # window. Retain their raw lines too, so decoded context
+                        # fragments have their own source citations in the audit.
+                        retained_numbers = {item["line_number"] for item in evidence}
+                        cell_numbers = {number for cell in cells for number in range(cell["line_number"], cell["end_line"] + 1)}
+                        evidence.extend(make_line_evidence(file_record, [
+                            {"line_number": number, "text": source_lines[number - 1]}
+                            for number in sorted(cell_numbers - retained_numbers)
+                        ], "surrounding_code"))
+                        for cell in cells:
+                            cell["source_ids"] = [item["evidence_id"] for item in evidence
+                                                  if cell["line_number"] <= item["line_number"] <= cell["end_line"]]
+                            for source_mapping in cell["source_line_map"]:
+                                source_mapping["source_ids"] = [item["evidence_id"] for item in evidence
+                                                                if source_mapping["line_number"] <= item["line_number"] <= source_mapping["end_line"]]
+                        group["notebook_cells"].extend(cells)
+                        group["notebook_decoded_lines"].append({
+                            "file": file_record["file"], "commit": file_record["commit"],
+                            "line_numbers": sorted(decoded_lines),
+                        })
+                        group["evidence_gaps"].extend(gaps)
+                    else:
+                        group["evidence_gaps"].append(
+                            f"{file_record['file']}: differing saved/fetched notebook lines prevent reliable cell decoding."
+                        )
         for item in evidence:
             evidence_by_id[item["evidence_id"]] = item
     if not offline:
@@ -213,11 +251,13 @@ def enrich_evidence_group(
 
 
 def build_evidence_packets(group: dict[str, Any], max_packet_bytes: int) -> list[dict[str, Any]]:
-    """Pack a repository/product's evidence into bounded JSON request inputs.
+    """Package matched code blocks with concise product and repository context.
 
-    Preserve every evidence fragment and repeat product metadata in each packet.
-    Packets split in file/line order. Combining classifications is a separate,
-    conservative step; each packet explicitly identifies its partial scope.
+    Raw line evidence and complete catalog metadata remain unchanged in the
+    group's audit. Version-two packets use short citation IDs, readable notebook
+    text, and deduplicated blocks. README background accompanies matches and does
+    not create independent classification requests. Archived evidence can be
+    repackaged without network access or modifying its original saved files.
 
     Args:
         group: Enriched repository/product group.
@@ -227,27 +267,6 @@ def build_evidence_packets(group: dict[str, Any], max_packet_bytes: int) -> list
         Ordered packets; an empty list for groups without usable matching lines.
 
     Raises:
-        ValueError: If metadata plus a fragment cannot fit; no evidence is dropped.
+        ValueError: If metadata or locations cannot fit; no matches are dropped.
     """
-    if not any(item["kind"] == "matching_line" for item in group["evidence"]):
-        return []
-    metadata = {
-        "repository": group["repository"], "product": group["product"],
-        "warnings": group["warnings"], "search_complete": group["search_complete"],
-        "scope": "Only this packet's excerpts; other packets may contain additional evidence.",
-    }
-    packets = []
-    current_packet = {**metadata, "evidence": []}
-    for item in group["evidence"]:
-        candidate = {**metadata, "evidence": [*current_packet["evidence"], item]}
-        if len(serialize_evidence(candidate).encode("utf-8")) > max_packet_bytes:
-            if current_packet["evidence"]:
-                packets.append(current_packet)
-            current_packet = {**metadata, "evidence": [item]}
-            if len(serialize_evidence(current_packet).encode("utf-8")) > max_packet_bytes:
-                raise ValueError("Product metadata plus evidence exceeds --packet-bytes; increase it and prepare a new directory.")
-        else:
-            current_packet = candidate
-    if current_packet["evidence"]:
-        packets.append(current_packet)
-    return packets
+    return package_evidence_blocks(group, max_packet_bytes)

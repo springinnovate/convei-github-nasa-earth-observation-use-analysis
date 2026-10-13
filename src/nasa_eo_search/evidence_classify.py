@@ -58,10 +58,27 @@ def prepare_classification_evidence(arguments: argparse.Namespace) -> int:
         except ValueError as error:
             group["packets"] = []
             group["preparation_error"] = str(error)
+    return save_prepared_classification_plan(output_directory, plan)
+
+
+def save_prepared_classification_plan(output_directory: Path, plan: dict[str, Any]) -> int:
+    """Save a new immutable v2 preparation and its credential-free review preview.
+
+    Args:
+        output_directory: New destination that must not already exist.
+        plan: Product groups with raw evidence, compact blocks, and packets.
+
+    Returns:
+        Zero for usable groups, or four when at least one group is blocked.
+
+    Raises:
+        OSError: If creating or writing the destination fails.
+        ValueError: If the prepared report cannot be generated.
+    """
     output_directory.mkdir(parents=True, exist_ok=False)
     with lock_batch_directory(output_directory):
         save_evidence_json(output_directory / "plan.json", {
-            "schema_version": 1, "plan_id": identify_evidence(plan), "data": plan,
+            "schema_version": 2, "plan_id": identify_evidence(plan), "data": plan,
         })
         save_evidence_json(output_directory / "prompt.json", {"version": PROMPT_VERSION, "instructions": CLASSIFICATION_PROMPT})
         summary = write_evidence_reports(output_directory, plan, None)
@@ -69,6 +86,81 @@ def prepare_classification_evidence(arguments: argparse.Namespace) -> int:
           f"{summary['planned_requests']} planned requests. No OpenAI calls made. "
           f"Inspect {output_directory / 'review.csv'} and plan.json.", file=sys.stderr)
     return 4 if summary["groups_by_status"]["blocked"] else 0
+
+
+def repack_saved_classification_evidence(arguments: argparse.Namespace) -> int:
+    """Repackage saved excerpts into a new v2 directory without network access.
+
+    Use this to compare packaging on identical v1 or v2 source evidence. Original
+    plans and paid responses remain untouched; changed requests cannot reuse old
+    classifications. Missing notebook context stays a recorded limitation.
+
+    Args:
+        arguments: Source directory, new output directory, and packet byte cap.
+
+    Returns:
+        Zero after preparation, or four if at least one group is blocked.
+
+    Raises:
+        OSError: If reading the source or writing the new destination fails.
+        ValueError: If the source hash/version is invalid or bounds are invalid.
+    """
+    if arguments.packet_bytes < 4096:
+        raise ValueError("--packet-bytes must be at least 4096.")
+    output_directory = arguments.output.resolve()
+    if output_directory.exists():
+        raise ValueError("Repacking requires a new output directory; the source stays unchanged.")
+    source_directory = arguments.source.resolve()
+    envelope = read_evidence_json(source_directory / "plan.json")
+    plan = envelope.get("data")
+    schema_version = envelope.get("schema_version")
+    supported_versions = {1: "repository-product-v1", 2: PROMPT_VERSION}
+    if (type(schema_version) is not int or schema_version not in supported_versions
+            or not isinstance(plan, dict)
+            or plan.get("prompt_version") != supported_versions[schema_version]
+            or envelope.get("plan_id") != identify_evidence(plan)
+            or not isinstance(plan.get("groups"), list)):
+        raise ValueError("Saved preparation is invalid, changed, or uses an unsupported version.")
+    original_plan_id = envelope["plan_id"]
+    source_packets = []
+    seen_group_ids = set()
+    for group in plan["groups"]:
+        if (not isinstance(group, dict) or not isinstance(group.get("product"), dict)
+                or not isinstance(group.get("evidence"), list)
+                or not isinstance(group.get("files"), list)
+                or not isinstance(group.get("packets"), list)
+                or not isinstance(group.get("warnings"), list)):
+            raise ValueError("Saved preparation contains a malformed evidence group.")
+        expected_group_id = identify_evidence([
+            group.get("repository"), group["product"].get("provider"),
+            group["product"].get("short_name"),
+        ])
+        if group.get("group_id") != expected_group_id or expected_group_id in seen_group_ids:
+            raise ValueError("Saved preparation contains an invalid evidence group identity.")
+        seen_group_ids.add(expected_group_id)
+        source_packets.extend(group["packets"])
+        group.pop("preparation_error", None)
+        try:
+            group["packets"] = build_evidence_packets(group, arguments.packet_bytes)
+        except ValueError as error:
+            group["packets"] = []
+            group["preparation_error"] = str(error)
+    source_input_bytes = sum(len(serialize_evidence(packet).encode("utf-8")) for packet in source_packets)
+    plan.update({
+        "prompt_version": PROMPT_VERSION, "created_at": datetime.now(timezone.utc).isoformat(),
+        "packet_bytes": arguments.packet_bytes,
+        "repacked_from": {
+            "plan_id": original_plan_id, "directory": str(source_directory),
+            "planned_requests": len(source_packets), "input_packet_bytes": source_input_bytes,
+        },
+    })
+    result = save_prepared_classification_plan(output_directory, plan)
+    repacked_packets = [packet for group in plan["groups"] for packet in group["packets"]]
+    repacked_input_bytes = sum(len(serialize_evidence(packet).encode("utf-8")) for packet in repacked_packets)
+    print(f"Repacked inputs: {len(source_packets)} -> {len(repacked_packets)} planned requests; "
+          f"{source_input_bytes} -> {repacked_input_bytes} JSON bytes. "
+          "These are input bytes, not measured tokens or API costs.", file=sys.stderr)
+    return result
 
 
 def select_classification_settings(output_directory: Path, model: str, max_output_tokens: int) -> dict[str, Any]:
@@ -184,7 +276,11 @@ def run_prepared_classifications(arguments: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             interrupted = True
         summary = write_evidence_reports(output_directory, plan, settings)
-    print(f"Classification {summary['status']}. Review {output_directory / 'review.csv'}. "
+    print(f"Classification {summary['status']}. "
+          f"{summary['groups_by_status']['complete']}/{summary['repository_product_groups']} assessments complete; "
+          f"{summary['pending_requests']} unstarted requests; "
+          f"{summary['failed_or_uncertain_requests']} failed/uncertain requests. "
+          f"Review {output_directory / 'review.csv'}. "
           "Completed processing does not establish exhaustive GitHub coverage or validated data use.", file=sys.stderr)
     return 130 if interrupted else {"complete": 0, "incomplete": 4, "failed": 1}[summary["status"]]
 
@@ -193,7 +289,8 @@ def main(argument_values: list[str] | None = None) -> int:
     """Run nasa-evidence-classify preparation, preview, or resumable classification.
 
     Prepare reads a saved batch and catalog, optionally fetches public GitHub
-    context, and writes a new evidence directory. Run reads that directory and
+    context, and writes a new evidence directory. Repack transforms saved excerpts
+    without network access into another new directory. Run reads that directory and
     writes model receipts and review.csv. Diagnostics go to standard error.
 
     Args:
@@ -213,6 +310,10 @@ def main(argument_values: list[str] | None = None) -> int:
     prepare.add_argument("--offline", action="store_true", help="use saved matching lines without fetching code context")
     prepare.add_argument("--context-lines", type=int, default=10, help="lines before/after each match (default: 10)")
     prepare.add_argument("--packet-bytes", type=int, default=24000, help="maximum UTF-8 JSON bytes per evidence packet (default: 24000)")
+    repack = commands.add_parser("repack", help="repackage saved v1/v2 evidence without network or model calls")
+    repack.add_argument("source", type=Path, help="existing prepared evidence directory")
+    repack.add_argument("--output", required=True, type=Path, help="new v2 evidence directory")
+    repack.add_argument("--packet-bytes", type=int, default=24000, help="maximum UTF-8 JSON bytes per evidence packet (default: 24000)")
     run = commands.add_parser("run", help="classify or resume a prepared evidence directory")
     run.add_argument("output", type=Path)
     run.add_argument("--model", required=True, help="OpenAI model supporting Responses structured outputs")
@@ -228,7 +329,11 @@ def main(argument_values: list[str] | None = None) -> int:
         command_parser.add_argument("--ca-bundle", help="optional PEM certificate authority bundle")
     arguments = parser.parse_args(argument_values)
     try:
-        return prepare_classification_evidence(arguments) if arguments.command == "prepare" else run_prepared_classifications(arguments)
+        if arguments.command == "prepare":
+            return prepare_classification_evidence(arguments)
+        if arguments.command == "repack":
+            return repack_saved_classification_evidence(arguments)
+        return run_prepared_classifications(arguments)
     except (OSError, ValueError, SourcegraphError) as error:
         print(f"nasa-evidence-classify: {error}", file=sys.stderr)
         return 1
