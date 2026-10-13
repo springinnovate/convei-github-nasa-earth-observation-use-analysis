@@ -2,7 +2,8 @@
 
 Collect NASA product names and identifiers, export them to a spreadsheet, and
 search public code for references using Sourcegraph, and classify saved evidence
-into a repository/product review spreadsheet.
+into a repository/product review spreadsheet. Review the evidence yourself and
+compare your judgments with the saved model results without additional API calls.
 
 ## Install
 
@@ -472,8 +473,9 @@ GitHub repositories were searched or that the model's judgment is correct.
 | `requests/<request-hash>/attempt-000001.json` | Credential-free request, timestamps, raw model response when available, validation result, and error. Retries get new numbered files. |
 | `summary.json` | Group/request counts, processing status, recorded token usage across attempts, and attempts without usage data. |
 
-Reports refresh during classification. **Save a copy of `review.csv` before adding
-review notes**; subsequent runs regenerate it. Text fields use the same spreadsheet
+Reports refresh during classification. Use the separate human-review workflow below
+for persistent labels; the blank human columns in `review.csv` are regenerated and
+are not imported automatically. Text fields use the same spreadsheet
 protection as the catalog export. Original evidence remains in JSON if a spreadsheet
 truncates a large cell. Prepared files are sufficient to resume after the source
 catalog or batch is moved.
@@ -482,6 +484,170 @@ Exit code 0 means preparation/repacking/preview succeeded or classification proc
 completed; 4 means pending or blocked work; 1 means invalid inputs, file errors,
 or failed requests; 130 means interruption. Inspect terminal errors as well as
 `summary.json`, especially if an open spreadsheet prevents report replacement.
+
+## Review evidence and measure classification quality
+
+`nasa-evidence-review` works entirely offline with saved results. It needs no API
+key and makes no model calls or repository downloads. After installing the new
+command with `python -m pip install -e .`, create a review from a format-2
+classification directory, such as your completed `pilot-review-v3`:
+
+```console
+nasa-evidence-review prepare pilot-review-v3 --output pilot-human-review
+```
+
+Open `pilot-human-review/evidence.html` in your browser and
+`pilot-human-review/human-labels.csv` in your spreadsheet application. The page
+shows the collected evidence and pinned source links, with model conclusions
+hidden. Each CSV row is one repository/product pair. The five existing pilot
+assessments can be kept this way as regression examples: repeatable checks of
+previous cases, not a new held-out test.
+
+Fill in these columns; leave the repository, product, and identifier columns intact:
+
+| Column | What to enter |
+| --- | --- |
+| `human_category` | One of the five categories above. Leave blank if you have not reviewed the pair. |
+| `supporting_citation` | One evidence block ID, such as `E1`, or its exact pinned source URL from the page. Required for a category other than `unclear`. |
+| `evidence_sufficiency` | `sufficient`, `insufficient`, or `uncertain`: is the supplied evidence enough to make your judgment? |
+| `missing_context_reason` | What decisive context is missing. Required for insufficient or uncertain evidence. |
+| `notes` | Optional reasoning or findings from inspecting the wider repository. |
+| `review_minutes` | Optional time spent reviewing this pair, in minutes. Blank means unrecorded, not zero. |
+
+Judge the supplied evidence before opening model conclusions. If you inspect the
+wider repository and discover omitted context, record it in `notes` and
+`missing_context_reason`. Keep that separate from your judgment of the supplied
+excerpts. Insufficient or uncertain evidence must be labeled `unclear`, not
+`unrelated`. A definitive category requires sufficient evidence and a citation.
+These checks validate the form of a label; a person still needs to judge its meaning.
+
+Save the labels as UTF-8 CSV, then compare:
+
+```console
+nasa-evidence-review compare pilot-human-review --output pilot-validation
+```
+
+Open `pilot-validation/metrics.html` for readable counts and rates, or
+`comparison.csv` to inspect individual disagreements. `metrics.json` contains the
+full breakdown. The command reads your labels but never rewrites them. It also
+leaves the original classifications unchanged. Choose a new output directory
+when calculating reports again after editing labels.
+
+The comparison separates:
+
+- Category agreement/disagreement among completed, reviewed pairs with definitive
+  human and model categories. Model `unclear` is a separate abstention, not silently
+  counted as a correct or incorrect definitive judgment.
+- False use/support claims: model `direct_use` or `supporting_software` when the
+  reviewer finds only `reference_only` or `unrelated`.
+- Missed supported findings: the reverse situation. Human-supported cases where
+  the model abstained are reported separately with the same denominator.
+- Insufficient evidence, missing context, model review flags, and recorded human
+  review time.
+- Planned/completed requests, saved attempts, and recorded input/output tokens for
+  the selected evidence. Attempts without recorded usage are counted; token totals
+  are not dollar estimates.
+
+Every rate has a numerator and denominator. Missing, stale, unreviewed, unfinished,
+and unclear cases have explicit exclusion counts. A zero denominator means the
+rate is unavailable, not zero percent. Small convenience samples describe those
+examples, not classification accuracy across GitHub.
+
+### Preserve labels and compare another saved run
+
+The review directory freezes its evidence, baseline responses, and sample selection:
+
+| File | Contents |
+| --- | --- |
+| `human-labels.csv` | Your editable judgments, stored separately from machine reports. |
+| `evidence.html` | All selected evidence excerpts and source links without model conclusions. |
+| `evidence.json` | Frozen source evidence, packets, and search provenance. |
+| `machine-snapshot.json` | Baseline judgments and saved request/response receipts. Open after labeling to avoid influencing your review. |
+| `manifest.json` | Content-checked sample membership, evidence revisions, and splits. Do not edit this file. |
+| `selection.csv` | Editable starting worksheet for making a different selection in a new review directory. |
+| `known-examples.csv` | Empty worksheet for the independent retrieval check below. |
+
+A label is tied to both repository/product identity and an evidence revision.
+Changed excerpts, context, packaging, or evidence limitations make it stale;
+timestamps, moved folders, and different model responses alone do not. Comparisons
+never silently carry labels onto changed evidence. Re-review a changed example in
+a new review directory; keep the old labels for its original revision.
+
+Compare the same human labels with a different saved classification run:
+
+```console
+nasa-evidence-review compare pilot-human-review --classifications another-review --output another-validation
+```
+
+Here `another-review` must already exist; this command does not create new model
+responses. Omit `--classifications` to use the frozen baseline, even after the
+original classification folder has moved. Use `--labels PATH` to read a separately
+maintained label CSV. Labels for other groups/revisions remain unused and are
+counted in `unused_label_rows`. Each comparison also saves `comparison-inputs.json`
+to pin the precise machine snapshot, labels, and selection behind its metrics.
+
+### Separate calibration cases from test cases
+
+By default every saved pair is an `ordinary` `regression` example. For a broader
+sample, edit the generated `selection.csv`: keep the pairs you want and set:
+
+- `split`: `development` for rubric calibration, `test` for held-out checking,
+  or `regression` for previously examined cases.
+- `sample_kind`: `ordinary` for ordinary sampled results or `challenge` for
+  deliberately difficult identifiers, versions, examples, or missing context.
+- `family`: a shared name for a repository and any forks or closely related
+  repositories. The default is the repository name. Set related families yourself;
+  this offline command cannot discover fork relationships.
+
+Freeze that edited selection in a new review:
+
+```console
+nasa-evidence-review prepare pilot-review-v3 --selection pilot-human-review/selection.csv --output selected-human-review
+```
+
+The selection must refer to pairs in the supplied classification directory. It
+rejects duplicate or unknown pairs, different families for the same repository,
+and families assigned to more than one split. All products from a repository stay
+together. Editing the worksheet does not alter an existing frozen review.
+
+For a 50-pair sample across about ten products, roughly ten calibration pairs and
+forty test pairs is a useful starting allocation; adjust for whole repository
+families. Check both ordinary and challenging examples, label test evidence before
+viewing model conclusions, and avoid tuning against those test judgments. Reports
+break out splits and sample kinds separately; the command does not perform random
+sampling or turn a hand-selected set into a representative population estimate.
+
+### Check whether known repositories were retrieved
+
+Search quality is a separate question from whether the classifier judged a hit
+correctly. Fill the empty `known-examples.csv` with examples you know from
+documentation or domain knowledge, independently of the measured search's hits.
+About twenty varied examples is a manageable starting check.
+
+Each row needs `repository` in `github.com/owner/repository` form, `provider`,
+`short_name`, a supporting `source_url`, and `discovery_basis` set to
+`independent_documentation` or `domain_knowledge`. Leave `miss_reason` blank until
+you investigate, or use `query_signature`, `index_coverage`, `search_limits`,
+`revision_access`, or `unknown`. Record the investigation in `notes`. The tool
+records these declarations but cannot verify their independence or infer why a
+repository was missed.
+
+```console
+nasa-evidence-review retrieval pilot-review-v3 --known-examples pilot-human-review/known-examples.csv --output pilot-retrieval
+```
+
+`retrieval.csv` reports `found`, `searched_zero_not_observed`, `incomplete`, or
+`not_searched`, along with saved queries and scope. `found` means a saved file hit
+for that repository/product, regardless of its later model category; inspect it
+to confirm it is relevant. No hit after a completed query is not proof of no use.
+`retrieval-summary.json` gives counts and known-example retrieval rates for all
+listed examples, examples with started searches, and examples with completed
+searches. These rates are **not GitHub-wide recall**. Frozen inputs are saved in
+`retrieval-inputs.json`.
+
+All review subcommands require new output directories. Exit code 0 means files
+were generated, even if labels or model work are unfinished; 1 means an input/file
+error, 2 means invalid command syntax, and 130 means interruption.
 
 ## Preview one repository match
 
@@ -561,6 +727,7 @@ Use these module names with `python -m`, followed by the same command arguments:
 | `nasa-repo-search` | `nasa_eo_search.repo_search` |
 | `nasa-repo-batch` | `nasa_eo_search.repo_batch` |
 | `nasa-evidence-classify` | `nasa_eo_search.evidence_classify` |
+| `nasa-evidence-review` | `nasa_eo_search.evidence_review` |
 | `nasa-repo-preview` | `nasa_eo_search.repo_preview` |
 | `nasa-product-preview` | `nasa_eo_search.cmr` |
 | `sourcegraph-search` | `nasa_eo_search.sourcegraph` |

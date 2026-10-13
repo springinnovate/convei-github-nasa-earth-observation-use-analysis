@@ -25,6 +25,7 @@ nasa-repo-preview = "nasa_eo_search.repo_preview:main"
 nasa-repo-search = "nasa_eo_search.repo_search:main"
 nasa-repo-batch = "nasa_eo_search.repo_batch:main"
 nasa-evidence-classify = "nasa_eo_search.evidence_classify:main"
+nasa-evidence-review = "nasa_eo_search.evidence_review:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

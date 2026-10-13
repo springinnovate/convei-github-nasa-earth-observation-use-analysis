@@ -370,12 +370,12 @@ def collect_observed_versions(classifications: list[dict[str, Any]]) -> list[dic
             for version, citations in sorted(citations_by_version.items())]
 
 
-def write_evidence_reports(output_directory: Path, plan: dict[str, Any], settings: dict[str, Any] | None) -> dict[str, Any]:
-    """Refresh concise review.csv, full audit.json, and processing summary.json.
+def build_evidence_reports(output_directory: Path, plan: dict[str, Any], settings: dict[str, Any] | None) -> dict[str, Any]:
+    """Read saved responses and construct reports without modifying any files.
 
-    Human columns start blank; copy the CSV before adding review notes because
-    subsequent runs regenerate it. Report model processing independently of search
-    completeness. Include usage from all attempts, and count requests without usage.
+    Report model processing independently of search completeness. Include usage
+    from all attempts and count requests without usage. Return raw receipts for
+    frozen review snapshots; the ordinary report writer omits these duplicates.
 
     Args:
         output_directory: Command-owned output directory.
@@ -383,10 +383,10 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
         settings: Selected model/output limit, or None before the first run.
 
     Returns:
-        Summary counts, saved token usage, coverage, and overall execution status.
+        Rows, audit, and summary computed from validated saved responses.
 
     Raises:
-        OSError: If receipts cannot be read or reports cannot be written.
+        OSError: If receipts cannot be read.
         ValueError: If saved receipts have inconsistent identities.
     """
     rows = []
@@ -400,6 +400,9 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
         states = []
         errors = []
         packet_audits = []
+        group_usage = {"input_tokens": 0, "output_tokens": 0}
+        group_attempts = []
+        group_missing_usage = 0
         for packet_number, packet in enumerate(group["packets"], start=1):
             if settings is None:
                 states.append("pending")
@@ -428,13 +431,16 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
                 request_ids.add(request_id)
                 for attempt in attempts:
                     raw_receipt = read_evidence_json(attempt)
+                    group_attempts.append(raw_receipt)
                     response = raw_receipt.get("response")
                     usage = response.get("usage") if isinstance(response, dict) else None
                     if not isinstance(usage, dict) or not all(type(usage.get(field)) is int and usage[field] >= 0 for field in usage_totals):
                         attempts_without_usage += 1
+                        group_missing_usage += 1
                     else:
                         for field in usage_totals:
                             usage_totals[field] += usage[field]
+                            group_usage[field] += usage[field]
         request_states.extend(states)
         status = "complete" if states and all(state == "complete" for state in states) else "pending"
         if not group["packets"]:
@@ -471,6 +477,10 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
             "evidence_types": evidence_types, "observed_versions": observed_versions,
             "evidence_limitations": limitations, "search_complete": group["search_complete"],
             "citations": audit_citations, "evidence_blocks": group["evidence_blocks"], "packets": packet_audits,
+            "request_count": len(group["packets"]), "completed_requests": states.count("complete"),
+            "attempt_count": len(group_attempts), **group_usage,
+            "attempts_without_usage": group_missing_usage,
+            "saved_attempts": group_attempts,
         })
     counts = {status: sum(row["status"] == status for row in rows) for status in ("complete", "pending", "failed", "blocked")}
     overall_status = "failed" if counts["failed"] else "incomplete" if counts["pending"] or counts["blocked"] else "complete"
@@ -489,11 +499,34 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
             for status in sorted({search["status"] for search in plan.get("source_product_queries", [])})
         },
     }
-    write_protected_csv_rows(output_directory / "review.csv", REVIEW_COLUMNS, rows)
-    save_evidence_json(output_directory / "audit.json", {
+    audit = {
         "schema_version": 2, "prompt_version": PROMPT_VERSION, "model": settings["model"] if settings else None,
         "summary_method": "Strongest-supported packet conclusion; all packet judgments and citations retained below.",
         "search_scope": plan["search_scope"], "groups": audit_groups,
-    })
-    save_evidence_json(output_directory / "summary.json", summary)
-    return summary
+    }
+    return {"rows": rows, "audit": audit, "summary": summary}
+
+
+def write_evidence_reports(output_directory: Path, plan: dict[str, Any], settings: dict[str, Any] | None) -> dict[str, Any]:
+    """Refresh machine reports without reading or changing separate human labels.
+
+    Args:
+        output_directory: Existing classifier output directory.
+        plan: Validated frozen preparation plan.
+        settings: Model and output limit, or None before classification starts.
+
+    Returns:
+        Processing counts and recorded usage, independent of human validation.
+
+    Raises:
+        OSError: If receipts cannot be read or reports cannot be written.
+        ValueError: If saved receipts have inconsistent identities.
+    """
+    reports = build_evidence_reports(output_directory, plan, settings)
+    write_protected_csv_rows(output_directory / "review.csv", REVIEW_COLUMNS, reports["rows"])
+    # Raw requests already live in receipts; retain them only in frozen review snapshots.
+    for group in reports["audit"]["groups"]:
+        group.pop("saved_attempts")
+    save_evidence_json(output_directory / "audit.json", reports["audit"])
+    save_evidence_json(output_directory / "summary.json", reports["summary"])
+    return reports["summary"]
