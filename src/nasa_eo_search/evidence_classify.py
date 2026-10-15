@@ -211,7 +211,8 @@ def run_prepared_classifications(arguments: argparse.Namespace) -> int:
     """
     output_directory = arguments.output.resolve()
     plan = load_evidence_plan(output_directory)
-    if arguments.max_requests < 1:
+    is_file_plan = plan.get("assessment_unit") == "file"
+    if arguments.max_requests is not None and arguments.max_requests < 1:
         raise ValueError("--max-requests must be positive.")
     settings = select_classification_settings(output_directory, arguments.model, arguments.max_output_tokens)
     scheduled_requests = {}
@@ -226,7 +227,8 @@ def run_prepared_classifications(arguments: argparse.Namespace) -> int:
                 scheduled_requests.setdefault(identify_evidence(request_body), (request_body, packet))
     selected_requests = list(scheduled_requests.items())[:arguments.max_requests]
     request_bytes = sum(len(serialize_evidence(body).encode("utf-8")) for _, (body, _) in selected_requests)
-    print(f"{len(plan['groups'])} groups; {skipped_requests} cached requests; "
+    assessment_label = "file matches" if is_file_plan else "groups"
+    print(f"{len(plan['groups'])} {assessment_label}; {skipped_requests} cached requests; "
           f"{len(scheduled_requests)} eligible; at most {len(selected_requests)} new calls this invocation. "
           f"Request JSON: {request_bytes} bytes; generated-token ceiling: "
           f"{len(selected_requests) * settings['max_output_tokens']}. Bytes are not a token or price estimate.",
@@ -256,8 +258,9 @@ def run_prepared_classifications(arguments: argparse.Namespace) -> int:
                     "started_at": datetime.now(timezone.utc).isoformat(),
                 }
                 save_evidence_json(receipt_path, receipt)
+                file_label = f" / {packet['assessment_file']} at {packet.get('assessment_commit') or 'unknown revision'}" if is_file_plan else ""
                 print(f"[{number}/{len(selected_requests)}] Classify {packet['repository']} / "
-                      f"{packet['product']['short_name']} (request {request_id[:12]}).", file=sys.stderr, flush=True)
+                      f"{packet['product']['short_name']}{file_label} (request {request_id[:12]}).", file=sys.stderr, flush=True)
                 try:
                     receipt["response"] = request_evidence_classification(request_body, api_key, arguments.ca_bundle)
                     # Persist first: validation or process failure must not lose a paid response.
@@ -270,17 +273,20 @@ def run_prepared_classifications(arguments: argparse.Namespace) -> int:
                     print(f"Request failed: {error}", file=sys.stderr)
                 receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
                 save_evidence_json(receipt_path, receipt)
-                write_evidence_reports(output_directory, plan, settings)
+                if not is_file_plan:
+                    write_evidence_reports(output_directory, plan, settings)
                 if receipt["status"] == "failed":
                     break
         except KeyboardInterrupt:
             interrupted = True
         summary = write_evidence_reports(output_directory, plan, settings)
+    report_name = "classified-matches.csv" if is_file_plan else "review.csv"
+    assessment_count = summary["file_matches"] if is_file_plan else summary["repository_product_groups"]
     print(f"Classification {summary['status']}. "
-          f"{summary['groups_by_status']['complete']}/{summary['repository_product_groups']} assessments complete; "
+          f"{summary['groups_by_status']['complete']}/{assessment_count} assessments complete; "
           f"{summary['pending_requests']} unstarted requests; "
           f"{summary['failed_or_uncertain_requests']} failed/uncertain requests. "
-          f"Review {output_directory / 'review.csv'}. "
+          f"Results: {output_directory / report_name}. "
           "Completed processing does not establish exhaustive GitHub coverage or validated data use.", file=sys.stderr)
     return 130 if interrupted else {"complete": 0, "incomplete": 4, "failed": 1}[summary["status"]]
 
