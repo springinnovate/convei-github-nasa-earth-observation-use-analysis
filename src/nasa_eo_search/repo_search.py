@@ -12,6 +12,7 @@ import sys
 import time
 from typing import Any, Iterable, TextIO
 
+from nasa_eo_search.batch_files import atomic_batch_output
 from nasa_eo_search.repo_preview import build_sourcegraph_product_query
 from nasa_eo_search.sourcegraph import (
     DEFAULT_SOURCEGRAPH_ENDPOINT,
@@ -133,6 +134,11 @@ def save_search_stream_and_summarize(
     except (SourcegraphError, OSError) as search_error:
         run_summary["status"] = "failed"
         run_summary["error"] = str(search_error)
+        if isinstance(search_error, SourcegraphError):
+            if search_error.http_status is not None:
+                run_summary["http_status"] = search_error.http_status
+            if search_error.retry_after_seconds is not None:
+                run_summary["retry_after_seconds"] = search_error.retry_after_seconds
     except KeyboardInterrupt:
         run_summary["status"] = "interrupted"
     run_summary["repositories_with_matches"] = len(repository_names)
@@ -141,44 +147,28 @@ def save_search_stream_and_summarize(
     return run_summary
 
 
-def main(argument_values: list[str] | None = None) -> int:
-    """Run nasa-repo-search to save a product search in a new directory.
+def collect_repository_query(
+    search_query: str, output_directory: Path, ca_bundle_path: str | None,
+    timeout_seconds: float = 65.0,
+) -> int:
+    """Collect one exact Sourcegraph query into a new durable attempt directory.
 
-    Parse the phrase and output path, create matches.jsonl, events.jsonl, and
-    summary.json, and stream public code matches from Sourcegraph into those
-    files. Print saved-result counts and the final status to standard error.
+    Preserve the supplied query unchanged, flush incoming evidence, and publish
+    initial and final summaries atomically. Partial results survive failure or
+    interruption. This function makes one request and never retries it.
 
     Args:
-        argument_values: Arguments without the executable name; defaults to sys.argv.
+        search_query: Validated Sourcegraph query to send without rebuilding it.
+        output_directory: New directory for matches, events, and summary files.
+        ca_bundle_path: Optional PEM certificate-authority bundle.
+        timeout_seconds: Socket connection and read timeout in seconds.
 
     Returns:
         Zero when the service finishes with no reported limits, four for an
-        incomplete run, one for failure, or 130 for interruption. Argparse exits
-        with two for invalid arguments. Completion describes the queried index.
+        incomplete run, one for failure, or 130 for interruption.
     """
 
-    argument_parser = argparse.ArgumentParser(
-        prog="nasa-repo-search",
-        description="Save all returned public code matches, including forks and archives.",
-    )
-    argument_parser.add_argument("phrase", help="product term or phrase, e.g. ATL03")
-    argument_parser.add_argument(
-        "--output", required=True, type=Path,
-        help="new directory for matches.jsonl, events.jsonl, and summary.json",
-    )
-    argument_parser.add_argument(
-        "--all-hosts", action="store_true",
-        help="include every indexed public host (default: GitHub)",
-    )
-    argument_parser.add_argument("--ca-bundle", help="optional PEM CA bundle")
-    parsed_arguments = argument_parser.parse_args(argument_values)
-    search_phrase = parsed_arguments.phrase.strip()
-    if not search_phrase or any(ord(character) < 32 for character in search_phrase):
-        argument_parser.error("phrase must be nonempty and contain no control characters")
-    search_query = build_sourcegraph_product_query(
-        search_phrase, parsed_arguments.all_hosts, collect_all=True,
-    )
-    output_directory = parsed_arguments.output.resolve()
+    output_directory = output_directory.resolve()
     run_metadata = {
         "status": "running",
         "query": search_query,
@@ -190,10 +180,10 @@ def main(argument_values: list[str] | None = None) -> int:
     try:
         output_directory.mkdir(parents=True, exist_ok=False)
         summary_path = output_directory / "summary.json"
-        with summary_path.open("x", encoding="utf-8") as summary_output:
+        with atomic_batch_output(summary_path) as summary_output:
             json.dump(run_metadata, summary_output, indent=2)
         print(
-            f"Collecting all returned matches for {search_phrase!r}. "
+            f"Collecting returned matches for query {search_query!r}. "
             f"Saving to {output_directory}", file=sys.stderr, flush=True,
         )
         with (
@@ -201,14 +191,14 @@ def main(argument_values: list[str] | None = None) -> int:
             (output_directory / "events.jsonl").open("x", encoding="utf-8") as events_output,
             closing(stream_sourcegraph_search_events(
                 DEFAULT_SOURCEGRAPH_ENDPOINT, search_query,
-                os.environ.get("SOURCEGRAPH_TOKEN"), 65.0,
-                ca_bundle_path=parsed_arguments.ca_bundle,
+                os.environ.get("SOURCEGRAPH_TOKEN"), timeout_seconds,
+                ca_bundle_path=ca_bundle_path,
             )) as search_events,
         ):
             run_metadata.update(save_search_stream_and_summarize(
                 search_events, search_query, matches_output, events_output, sys.stderr,
             ))
-        with summary_path.open("w", encoding="utf-8") as summary_output:
+        with atomic_batch_output(summary_path) as summary_output:
             json.dump(run_metadata, summary_output, indent=2, ensure_ascii=True)
     except OSError as output_error:
         print(f"nasa-repo-search: {output_error}", file=sys.stderr)
@@ -232,6 +222,43 @@ def main(argument_values: list[str] | None = None) -> int:
         file=sys.stderr,
     )
     return 4
+
+
+def main(argument_values: list[str] | None = None) -> int:
+    """Save a phrase search and its completion evidence in a new directory.
+
+    Args:
+        argument_values: Arguments without the executable name; defaults to sys.argv.
+
+    Returns:
+        Zero for completion, four for incomplete results, one for failure, or
+        130 for interruption. Argparse exits with two for invalid arguments.
+    """
+
+    argument_parser = argparse.ArgumentParser(
+        prog="nasa-repo-search",
+        description="Save all returned public code matches, including forks and archives.",
+    )
+    argument_parser.add_argument("phrase", help="product term or phrase, e.g. ATL03")
+    argument_parser.add_argument(
+        "--output", required=True, type=Path,
+        help="new directory for matches.jsonl, events.jsonl, and summary.json",
+    )
+    argument_parser.add_argument(
+        "--all-hosts", action="store_true",
+        help="include every indexed public host (default: GitHub)",
+    )
+    argument_parser.add_argument("--ca-bundle", help="optional PEM CA bundle")
+    parsed_arguments = argument_parser.parse_args(argument_values)
+    search_phrase = parsed_arguments.phrase.strip()
+    if not search_phrase or any(ord(character) < 32 for character in search_phrase):
+        argument_parser.error("phrase must be nonempty and contain no control characters")
+    search_query = build_sourcegraph_product_query(
+        search_phrase, parsed_arguments.all_hosts, collect_all=True,
+    )
+    return collect_repository_query(
+        search_query, parsed_arguments.output, parsed_arguments.ca_bundle,
+    )
 
 
 if __name__ == "__main__":

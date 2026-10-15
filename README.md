@@ -13,15 +13,19 @@ python -m pip install -e .
 ```
 
 Run this again after pulling changes that add commands. If you already have the
-saved `nasa-catalog` directory, search ATL03:
+saved `nasa-catalog` directory, try ATL03 in a new output directory:
 
 ```console
-nasa-eo search nasa-catalog --short-name ATL03 --output atl03-files
+nasa-eo search nasa-catalog --short-name ATL03 --output atl03-files --max-requests 5
 ```
+
+This makes at most five search calls, including retries. Repeat the same command
+to continue; verified completed searches are skipped. Check `summary.json` and
+`matches.csv` after each run. A capped trial can finish before finding any hits.
 
 Put your raw OpenAI API key in `./secrets/openai.key`, as described below. Replace
 `YOUR_MODEL` with a model identifier available to your API account that supports
-Responses structured outputs. Then classify the saved matches:
+Responses structured outputs. Once you have saved matches, classify them:
 
 ```console
 nasa-eo classify atl03-files --model YOUR_MODEL --api-key-file ./secrets/openai.key --output atl03-classified
@@ -79,39 +83,70 @@ EOSDIS-tagged CMR records at collection time, not every NASA dataset.
 
 ## 2. Search public code
 
-With no product filter, search uses every collected dataset and all of its saved
-candidate identifiers. Preview the query count before starting a full catalog:
+Start with one or a few datasets and inspect their results before a larger run.
+Repeat `--short-name` to select several exact dataset names:
 
 ```console
-nasa-eo search nasa-catalog --output nasa-files --dry-run
-nasa-eo search nasa-catalog --output nasa-files
+nasa-eo search nasa-catalog --short-name ATL03 --short-name ATL06 --output ice-files --dry-run
+nasa-eo search nasa-catalog --short-name ATL03 --short-name ATL06 --output ice-files --max-requests 5
 ```
 
-`--dry-run` prints the dataset count, distinct query count, and scope without
-making searches or writing files. There is no default twenty-query limit;
-a full catalog can produce many thousands of queries.
-
-Use repeatable exact short-name filters for a smaller run:
-
-```console
-nasa-eo search nasa-catalog --short-name ATL03 --short-name ATL06 --output ice-files
-```
+`--dry-run` prints dataset, distinct-term, and query counts plus the scope, without
+searching or writing files. With no `--short-name`, every collected dataset and
+candidate identifier is selected. A full catalog can produce hundreds of
+thousands of partition queries; it is not a small trial.
 
 Each selected dataset contributes its collected short name, entry identifiers,
-and collection concept identifiers. Identical terms shared by datasets are
-searched once and associated with each dataset. The query treats each term as
+and collection concept identifiers. Identical terms shared by datasets use one
+set of queries associated with each dataset. The query treats each term as
 literal text with non-alphanumeric boundaries: `ATL03` can match `ATL03_007` or
 `test_atl03`, but not `MATL03`. Matching is case-insensitive.
 
-This is identifier matching, not semantic search. The software does not invent
-download URLs, filename patterns, or other signatures absent from the saved
-catalog. A hit can still mean something unrelated to NASA.
+Search uses these literal metadata identifiers, not semantic similarity or
+invented download URLs and filename patterns. A hit can still be unrelated to NASA.
 
 Searches cover **public GitHub content in Sourcegraph's index**, including forks
 and archived repositories. Add `--all-hosts` to include other indexed public
-code hosts. Neither setting searches every public repository. Queries run
-sequentially; Sourcegraph's time or result limits are recorded, not treated as
-proof of complete GitHub coverage.
+code hosts. Neither setting searches every public repository.
+
+A [small live trial](docs/search-reliability-trial.md) found that broad searches
+could miss known indexed files even without reported limits. The current
+partition strategy is not validated for a full-catalog run.
+
+Each term is searched in nine nonoverlapping repository groups, called
+partitions. Eight divide GitHub owners by their first character: digits/A–C,
+D–F, G–I, J–L, M–O, P–R, S–U, and V–Z, including lowercase equivalents.
+The remainder includes every other GitHub prefix and, with `--all-hosts`, other
+code hosts. These filters cover the selected scope without handpicked repositories.
+
+### Limits, retries, and resume
+
+Queries run sequentially with a default 10-second server search timeout. Set
+`--search-timeout 20` for a new run to change it; allowed values are 1–60 seconds.
+Connection time and retry delays can make a call take longer. The saved timeout,
+selected datasets, and host scope are fixed: use a new output directory to change
+them. Omit the timeout on resume to retain its saved value.
+
+`--max-requests 5` caps all new Sourcegraph calls in that invocation, including
+retries. There is no default request cap. Each partition has a default lifetime
+allowance of two attempts; ordinary resume consumes the remaining allowance
+without resetting it. Verified completed partitions are skipped, while retries
+restart only the unfinished partition and preserve earlier attempt files.
+
+Repeat the same command and output directory to resume, keeping the catalog
+unchanged. Inspect warnings before adding `--retry-incomplete`: it grants two
+further attempts to each previously attempted, unfinished partition reached in
+that run. The saved allowance survives a request cap or interruption; later
+ordinary resumes can use what remains. New partitions retain their two attempts.
+
+Three consecutive unsuccessful calls stop the invocation. HTTP 400, 401, or 403
+stops it immediately; a long server-requested retry delay is saved for later
+resume. Read the stop reason in `progress.json` or `summary.json` before retrying.
+Press Ctrl+C to stop and retain collected results.
+
+Existing schema-version-1 outputs keep their original global-query strategy.
+They reject the new timeout, request-cap, and retry flags. Use a new output
+directory to get partitioned searches; old results are not overwritten or migrated.
 
 ### Search output and completion
 
@@ -123,27 +158,29 @@ different revisions remain separate. Its columns are:
 - `repository`, `file`, `commit`, `line_numbers`, `snippet`, `source_url`.
 - `search_terms`, `search_complete`, `warnings`.
 
-`searches.csv` includes every dataset/query association, including queries with
-no hits. `summary.json` gives overall counts and status. `plan.json` preserves
-the selected terms and their sources; `searches/` retains original attempt data.
+`searches.csv` includes every dataset/query association, even with no hits, and a
+`repository_partition` column for new runs. A `scope_note` identifies confirmed
+empty repository groups; these count as completed zero-hit searches, with the
+original service alert retained in raw attempt files. `plan.json` preserves terms, sources,
+scope, partitions, and timeout; `searches/` retains original attempt data.
+`progress.json` is replaced atomically for each request. It and `summary.json`
+show current status counts, the current query, and the stop reason. Combined CSVs
+refresh at startup and when execution stops, including Ctrl+C; while searching,
+their last refresh time is recorded separately from the live counts.
 
 | Query status | Meaning |
 | --- | --- |
 | `pending` | The query has not started. |
 | `finished_no_reported_limits` | The service confirmed completion without reported limits, and saved evidence passed validation. |
-| `incomplete` | Limits were reported or the stream ended before confirmed completion. |
+| `incomplete` | Limits were reported, the stream ended early, or results failed the partition-scope check. |
 | `failed` | A request, file, or saved-evidence validation error occurred. |
 | `interrupted` | Processing stopped before the attempt finished. |
 
-`search_complete=true` means all selected queries for that dataset finished
-without reported limits. It does not mean all GitHub repositories were searched.
-A missing match is not proof that no repository uses the dataset.
-
-Press Ctrl+C to stop. Repeat the same search command and output directory to
-resume: verified completed queries are skipped, and unfinished queries are
-retried from the beginning in new attempt directories. Older results remain
-available. Keep the source catalog unchanged; use a new output directory to
-change the dataset selection or search scope.
+For partitioned runs, `search_complete=true` requires a complete source catalog
+and successful completion of every selected term's nine partitions for that
+dataset. A finished partition with zero hits is different from one that timed
+out. Neither a complete run nor a missing match establishes complete GitHub
+coverage or absence of use.
 
 ## 3. Classify matching files
 

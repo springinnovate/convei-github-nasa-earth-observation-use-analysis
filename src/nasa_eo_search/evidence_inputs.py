@@ -114,7 +114,11 @@ def read_product_evidence_groups(batch_directory: Path, catalog_directory: Path)
     product_searches: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for job in batch_plan["jobs"]:
         attempts = list_search_attempts(batch_directory, job["search_id"])
-        inspected = [(attempt, *inspect_search_attempt(attempt, job["query"])) for attempt in attempts]
+        inspected = [(attempt, *inspect_search_attempt(
+            attempt, job["query"],
+            partition_id=job.get("partition_id") if batch_plan["schema_version"] == 2 else None,
+            all_hosts=batch_plan["all_hosts"],
+        )) for attempt in attempts]
         latest_summary = inspected[-1][1] if inspected else {"status": "pending"}
         for association in job["products"]:
             product_key = (association["provider"], association["short_name"])

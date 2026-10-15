@@ -9,10 +9,16 @@ import tempfile
 from typing import Any, Iterator, TextIO
 
 from nasa_eo_search.repo_preview import format_repository_match
+from nasa_eo_search.search_partitions import repository_matches_partition
 from nasa_eo_search.sourcegraph import DEFAULT_SOURCEGRAPH_ENDPOINT
 
 
 COMPLETED_SEARCH = "finished_no_reported_limits"
+EMPTY_REPOSITORY_SCOPE_NOTICE = {
+    "title": "No repositories found",
+    "description": "Try using a different `repo:<regexp>` filter to see results",
+    "proposedQueries": None,
+}
 
 
 def list_search_attempts(output_directory: Path, search_id: str) -> list[Path]:
@@ -43,17 +49,27 @@ def list_search_attempts(output_directory: Path, search_id: str) -> list[Path]:
     return [attempts_by_number[number] for number in sorted(attempts_by_number)]
 
 
-def inspect_search_attempt(attempt: Path, query: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def inspect_search_attempt(
+    attempt: Path, query: str, *, partition_id: str | None = None, all_hosts: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Verify a saved attempt before skipping it on resume or reporting matches.
 
     A completed attempt needs final completion flags, no warnings, matching query
     metadata, both evidence files, and the expected number of valid match records.
     Preserve readable matches before a corrupt record for inspection. A saved
     running status means the previous process stopped before finalizing it.
+    When a partition is supplied, keep out-of-scope matches as evidence but mark
+    an otherwise completed attempt incomplete. Never rewrite saved source files.
+    A completed zero-hit partition with the exact empty-repository alert is a
+    verified empty indexed scope, not a search limit. Its derived status is
+    completed with the alert retained in notices and the original incomplete
+    status retained in raw_status. The raw collector summary remains unchanged.
 
     Args:
         attempt: Existing attempt directory containing single-search outputs.
         query: Expected query from the batch plan.
+        partition_id: Repository partition to validate, or None for legacy searches.
+        all_hosts: Whether the partitioned plan includes non-GitHub public hosts.
 
     Returns:
         Attempt status/details and readable raw matches. Broken evidence is marked
@@ -131,7 +147,90 @@ def inspect_search_attempt(attempt: Path, query: str) -> tuple[dict[str, Any], l
             errors.append(str(evidence_error))
     if errors:
         summary = {**summary, "status": "failed", "error": "; ".join(errors)}
+    if partition_id is not None:
+        if not errors and not matches and verify_empty_partition_completion(attempt, summary):
+            summary = {
+                **summary, "raw_status": summary["status"], "status": COMPLETED_SEARCH,
+                "warnings": [], "notices": list(summary["warnings"]),
+                "completion_basis": "empty_indexed_repository_scope",
+            }
+        outside_partition = sum(not repository_matches_partition(
+            match.get("repository"), all_hosts, partition_id,
+        ) for match in matches)
+        if outside_partition:
+            scope_warning = {
+                "reason": "repository-partition-mismatch",
+                "message": f"{outside_partition} returned match records are outside partition {partition_id}.",
+            }
+            warnings = list(summary.get("warnings", []))
+            if scope_warning not in warnings:
+                warnings.append(scope_warning)
+            summary = {**summary, "warnings": warnings}
+            if summary["status"] == COMPLETED_SEARCH:
+                summary["status"] = "incomplete"
     return summary, matches
+
+
+def verify_empty_partition_completion(attempt: Path, summary: dict[str, Any]) -> bool:
+    """Verify that an empty partition ended normally despite its informational alert.
+
+    Call only after a validated partition's match file has been checked and found
+    empty. Require the exact observed empty-scope alert, zero final match counts,
+    no skipped work or other alerts, and consistent completion in both the raw
+    summary and saved events. Legacy/global searches do not use this exception.
+    Malformed or missing evidence remains unfinished rather than being promoted.
+
+    Args:
+        attempt: Existing directory containing the original events.jsonl file.
+        summary: Raw, validated attempt summary before any status interpretation.
+
+    Returns:
+        Whether the saved evidence proves a completed, empty indexed scope.
+        No source files are changed.
+    """
+    final_progress = summary.get("final_progress")
+    if (summary.get("status") != "incomplete" or summary.get("error")
+            or summary.get("received_done_event") is not True
+            or summary.get("received_final_progress") is not True
+            or type(summary.get("match_records_saved")) is not int
+            or summary["match_records_saved"] != 0
+            or summary.get("warnings") != [EMPTY_REPOSITORY_SCOPE_NOTICE]
+            or not isinstance(final_progress, dict) or final_progress.get("error")
+            or final_progress.get("done") is not True
+            or type(final_progress.get("matchCount")) is not int
+            or final_progress["matchCount"] != 0 or final_progress.get("skipped") != []):
+        return False
+    received_notice = False
+    received_done = False
+    saved_final_progress = None
+    try:
+        with (attempt / "events.jsonl").open(encoding="utf-8") as events_input:
+            for event_line in events_input:
+                event = json.loads(event_line)
+                if not isinstance(event, dict) or received_done:
+                    return False
+                event_type = event.get("event")
+                if event_type == "alert":
+                    if event.get("data") != EMPTY_REPOSITORY_SCOPE_NOTICE:
+                        return False
+                    received_notice = True
+                elif event_type == "progress":
+                    progress = event.get("data")
+                    if (not isinstance(progress, dict) or progress.get("error") or progress.get("skipped") != []
+                            or ("matchCount" in progress and (
+                                type(progress["matchCount"]) is not int or progress["matchCount"] != 0))):
+                        return False
+                    if progress.get("done") is True:
+                        saved_final_progress = progress
+                elif event_type == "done":
+                    if saved_final_progress is None or event.get("data") != {}:
+                        return False
+                    received_done = True
+                elif event_type != "filters":
+                    return False
+    except (OSError, ValueError):
+        return False
+    return received_notice and received_done and saved_final_progress == final_progress
 
 
 @contextmanager

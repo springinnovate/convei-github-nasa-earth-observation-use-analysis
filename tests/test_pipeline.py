@@ -10,8 +10,14 @@ import unittest
 from unittest.mock import patch
 
 from nasa_eo_search.catalog import CollectionPage
+from nasa_eo_search.evidence_reports import save_evidence_json
 from nasa_eo_search.pipeline import main
+from nasa_eo_search.pipeline_catalog import build_catalog_search_plan
 from nasa_eo_search.pipeline_tables import FILE_MATCH_COLUMNS, collapse_batch_file_rows
+from nasa_eo_search.repo_batch import main as run_legacy_batch_command
+from nasa_eo_search.search_partitions import (
+    REPOSITORY_PARTITIONS, repository_matches_partition,
+)
 from nasa_eo_search.sourcegraph import ServerSentEvent
 from test_catalog import EXAMPLE_COLLECTION
 from test_evidence_classify import make_model_response
@@ -36,12 +42,15 @@ def stream_pipeline_matches(*arguments, **options):
     """Return repeatable matches for two files, including two revisions of one file.
 
     Args:
-        *arguments: Search transport positional inputs, unused by the fake service.
+        *arguments: Search endpoint and exact query used to select the fixture scope.
         **options: Search transport settings, unused by the fake service.
 
     Yields:
-        Sourcegraph match and completion events; each query repeats these hits.
+        Match and completion events; only the fixture's repository group has hits.
     """
+    query = arguments[1]
+    partition = next((partition for partition in REPOSITORY_PARTITIONS
+                      if partition["filter"] in query), None)
     matches = [
         {"type": "content", "repository": "github.com/example/project", "path": path,
          "commit": revision, "repoStars": 42, "language": "Python",
@@ -52,9 +61,32 @@ def stream_pipeline_matches(*arguments, **options):
             ("sites.py", "abc123", 'site_name = "atl03"'),
         )
     ]
+    if partition and not repository_matches_partition(
+        "github.com/example/project", False, partition["id"],
+    ):
+        matches = []
     yield ServerSentEvent("matches", json.dumps(matches))
     yield ServerSentEvent("progress", json.dumps({"done": True, "skipped": []}))
     yield ServerSentEvent("done", "{}")
+
+
+def stream_single_pipeline_match(*arguments, **options):
+    """Return a single fixture hit only inside its planned repository partition.
+
+    Args:
+        *arguments: Endpoint and query supplied to the search transport.
+        **options: Transport settings unused by this offline responder.
+
+    Returns:
+        A fresh generator with one in-scope file match or a completed zero-hit search.
+    """
+    query = arguments[1]
+    partition = next((partition for partition in REPOSITORY_PARTITIONS
+                      if partition["filter"] in query), None)
+    include_match = partition is None or repository_matches_partition(
+        "github.com/example/project", False, partition["id"],
+    )
+    return example_search_events(include_match=include_match)
 
 
 def classify_pipeline_file(request_body: dict, api_key: str, ca_bundle_path: str | None) -> dict:
@@ -93,9 +125,9 @@ class SimplePipelineTests(unittest.TestCase):
             search_arguments = ["search", str(catalog), "--output", str(search)]
             with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_pipeline_matches) as requests, patch("nasa_eo_search.repo_batch.time.sleep"), redirect_stderr(StringIO()):
                 self.assertEqual(main(search_arguments), 0)
-                self.assertEqual(requests.call_count, 3)
+                self.assertEqual(requests.call_count, 27)
                 self.assertEqual(main(search_arguments), 0)
-                self.assertEqual(requests.call_count, 3)
+                self.assertEqual(requests.call_count, 27)
             matches = read_pipeline_csv(search / "matches.csv")
             self.assertEqual(len(matches), 3)
             self.assertEqual(len({row["match_id"] for row in matches}), 3)
@@ -131,7 +163,7 @@ class SimplePipelineTests(unittest.TestCase):
             with patch("nasa_eo_search.catalog.fetch_cmr_collection_page") as nasa, patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events") as search, redirect_stderr(StringIO()) as terminal:
                 self.assertEqual(main(["catalog", "--from", str(catalog), "--output", str(output)]), 0)
                 self.assertEqual(main(["search", str(catalog), "--output", str(preview), "--dry-run"]), 0)
-                self.assertIn("3 distinct search queries", terminal.getvalue())
+                self.assertIn("3 distinct terms; 27 search queries", terminal.getvalue())
                 nasa.assert_not_called()
                 search.assert_not_called()
             self.assertFalse(preview.exists())
@@ -145,15 +177,15 @@ class SimplePipelineTests(unittest.TestCase):
             catalog = save_pipeline_catalog(root, [make_pipeline_product()])
             output = root / "search"
             arguments = ["search", str(catalog), "--output", str(output)]
-            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", return_value=example_search_events()) as requests, patch("nasa_eo_search.repo_batch.time.sleep", side_effect=KeyboardInterrupt()), redirect_stderr(StringIO()):
+            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_single_pipeline_match) as requests, patch("nasa_eo_search.partition_search.time.sleep", side_effect=[None, KeyboardInterrupt()]), redirect_stderr(StringIO()):
                 self.assertEqual(main(arguments), 130)
-                requests.assert_called_once()
+                self.assertEqual(requests.call_count, 2)
             first_rows = read_pipeline_csv(output / "matches.csv")
             self.assertEqual(len(first_rows), 1)
             self.assertEqual(first_rows[0]["search_complete"], "false")
-            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=[example_search_events(), example_search_events()]) as requests, patch("nasa_eo_search.repo_batch.time.sleep"), redirect_stderr(StringIO()):
+            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_single_pipeline_match) as requests, patch("nasa_eo_search.partition_search.time.sleep"), redirect_stderr(StringIO()):
                 self.assertEqual(main(arguments), 0)
-                self.assertEqual(requests.call_count, 2)
+                self.assertEqual(requests.call_count, 25)
             final_rows = read_pipeline_csv(output / "matches.csv")
             self.assertEqual(len(final_rows), 1)
             self.assertEqual(final_rows[0]["search_complete"], "true")
@@ -173,6 +205,79 @@ class SimplePipelineTests(unittest.TestCase):
             with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events") as requests, redirect_stderr(StringIO()):
                 self.assertEqual(main(arguments[:-2]), 1)
                 self.assertEqual(main([*arguments, "--all-hosts"]), 1)
+                requests.assert_not_called()
+            self.assertEqual({path: path.read_bytes() for path in output.rglob("*") if path.is_file()}, saved_files)
+
+    def test_request_cap_checkpoints_and_resumes_saved_partition_queries(self) -> None:
+        """Pause after one call and finish only remaining partitions on resume."""
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            catalog = save_pipeline_catalog(root, [make_pipeline_product()])
+            output = root / "search"
+            arguments = ["search", str(catalog), "--output", str(output)]
+            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_single_pipeline_match) as requests, patch("nasa_eo_search.partition_search.time.sleep"), redirect_stderr(StringIO()):
+                self.assertEqual(main([*arguments, "--max-requests", "1"]), 4)
+                self.assertEqual(requests.call_count, 1)
+                checkpoint = json.loads((output / "progress.json").read_text(encoding="utf-8"))
+                self.assertEqual(checkpoint["stop_reason"], "request_limit_reached")
+                self.assertEqual(checkpoint["searches_by_status"]["finished_no_reported_limits"], 1)
+                self.assertEqual(checkpoint["searches_by_status"]["pending"], 26)
+                self.assertTrue(checkpoint["combined_reports_current"])
+                self.assertEqual(main([*arguments, "--max-requests", "26"]), 0)
+                self.assertEqual(requests.call_count, 27)
+            search_rows = read_pipeline_csv(output / "searches.csv")
+            self.assertEqual(len(search_rows), 27)
+            self.assertEqual({row["repository_partition"] for row in search_rows},
+                             {partition["id"] for partition in REPOSITORY_PARTITIONS})
+            self.assertTrue(all(row["search_complete"] == "true"
+                                for row in read_pipeline_csv(output / "matches.csv")))
+
+    def test_legacy_resume_dispatches_saved_partition_queries_without_widening_scope(self) -> None:
+        """Keep exact partition filters when the older resume command opens a new run."""
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            catalog = save_pipeline_catalog(root, [make_pipeline_product()])
+            output = root / "search"
+            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_single_pipeline_match) as requests, patch("nasa_eo_search.partition_search.time.sleep"), redirect_stderr(StringIO()):
+                self.assertEqual(main(["search", str(catalog), "--output", str(output), "--max-requests", "1"]), 4)
+                self.assertEqual(run_legacy_batch_command(["resume", str(output)]), 0)
+            saved_plan = json.loads((output / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual([request.args[1] for request in requests.call_args_list],
+                             [job["query"] for job in saved_plan["jobs"]])
+
+    def test_old_global_output_retains_strategy_and_rejects_partition_controls(self) -> None:
+        """Resume original outputs unchanged and require new storage for new controls."""
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            catalog = save_pipeline_catalog(root, [make_pipeline_product()])
+            output = root / "search"
+            output.mkdir()
+            legacy_plan = build_catalog_search_plan(catalog, None, False)
+            save_evidence_json(output / "plan.json", legacy_plan)
+            arguments = ["search", str(catalog), "--output", str(output)]
+            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_pipeline_matches) as requests, patch("nasa_eo_search.repo_batch.time.sleep"), redirect_stderr(StringIO()) as terminal:
+                self.assertEqual(main(arguments), 0)
+                self.assertEqual(requests.call_count, 3)
+                self.assertIn("original global-query strategy", terminal.getvalue())
+            saved_files = {path: path.read_bytes() for path in output.rglob("*") if path.is_file()}
+            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events") as requests, redirect_stderr(StringIO()):
+                for controls in (["--max-requests", "1"], ["--search-timeout", "20"], ["--retry-incomplete"]):
+                    self.assertEqual(main([*arguments, *controls]), 1)
+                requests.assert_not_called()
+            self.assertEqual({path: path.read_bytes() for path in output.rglob("*") if path.is_file()}, saved_files)
+
+    def test_changed_timeout_is_rejected_without_touching_saved_attempts(self) -> None:
+        """Freeze the server timeout with the query instead of changing it on resume."""
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            catalog = save_pipeline_catalog(root, [make_pipeline_product()])
+            output = root / "search"
+            arguments = ["search", str(catalog), "--output", str(output)]
+            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_single_pipeline_match), redirect_stderr(StringIO()):
+                self.assertEqual(main([*arguments, "--max-requests", "1"]), 4)
+            saved_files = {path: path.read_bytes() for path in output.rglob("*") if path.is_file()}
+            with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events") as requests, redirect_stderr(StringIO()):
+                self.assertEqual(main([*arguments, "--search-timeout", "20"]), 1)
                 requests.assert_not_called()
             self.assertEqual({path: path.read_bytes() for path in output.rglob("*") if path.is_file()}, saved_files)
 

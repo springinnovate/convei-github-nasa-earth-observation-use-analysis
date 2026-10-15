@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import json
+import math
 import os
 import socket
 import ssl
@@ -24,6 +27,48 @@ SOURCEGRAPH_CLIENT_USER_AGENT = "nasa-eo-sourcegraph-search/0.1"
 
 class SourcegraphError(RuntimeError):
     """Base error for a failed Sourcegraph search."""
+
+    def __init__(
+        self, message: str, *, http_status: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        """Retain server retry guidance alongside the readable failure message.
+
+        Args:
+            message: Description of the failed request or response.
+            http_status: HTTP status code when an HTTP response was received.
+            retry_after_seconds: Valid nonnegative Retry-After delay, if supplied.
+        """
+
+        super().__init__(message)
+        self.http_status = http_status
+        self.retry_after_seconds = retry_after_seconds
+
+
+def parse_retry_after_seconds(header_value: str | None) -> float | None:
+    """Convert an HTTP Retry-After delay or date to a finite numeric value.
+
+    Args:
+        header_value: Retry-After header containing seconds or an HTTP date.
+
+    Returns:
+        A finite, nonnegative delay in seconds, or None for an invalid header.
+        Past dates return zero; callers decide whether to wait or checkpoint.
+    """
+
+    if not header_value:
+        return None
+    try:
+        delay_seconds = float(header_value)
+    except ValueError:
+        try:
+            retry_date = parsedate_to_datetime(header_value)
+            if retry_date.tzinfo is None:
+                retry_date = retry_date.replace(tzinfo=timezone.utc)
+            delay_seconds = max(0.0, (retry_date - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return delay_seconds if math.isfinite(delay_seconds) and delay_seconds >= 0 else None
 
 
 class SourcegraphProtocolError(SourcegraphError):
@@ -220,7 +265,11 @@ def stream_sourcegraph_search_events(
             f": {response_detail}" if response_detail else ""
         )
         raise SourcegraphError(
-            f"Sourcegraph returned HTTP {http_error.code}{response_detail_suffix}"
+            f"Sourcegraph returned HTTP {http_error.code}{response_detail_suffix}",
+            http_status=http_error.code,
+            retry_after_seconds=parse_retry_after_seconds(
+                http_error.headers.get("Retry-After") if http_error.headers else None,
+            ),
         ) from http_error
     except (URLError, TimeoutError, socket.timeout) as connection_error:
         connection_failure_reason = getattr(
