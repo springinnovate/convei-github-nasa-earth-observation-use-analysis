@@ -1,566 +1,260 @@
-# NASA data references in public code
+# NASA dataset references in public code
 
-Collect NASA product names and identifiers, export them to a spreadsheet, and
-search public code for references using Sourcegraph, and classify saved evidence
-into a repository/product review spreadsheet.
+Use three commands to collect NASA dataset metadata, search public code for its
+identifiers, and have GPT classify the matching files. The main outputs are
+`datasets.csv`, `matches.csv`, and `classified-matches.csv`.
 
-## Install
+## Install and try one dataset
 
-Use Python 3.10 or newer. From the repository directory, run:
+Use Python 3.10 or newer. From this repository directory:
 
 ```console
 python -m pip install -e .
 ```
 
-Run this command again after pulling changes that add command-line tools.
-
-## Start here
-
-Collect the catalog and export it for review:
+Run this again after pulling changes that add commands. If you already have the
+saved `nasa-catalog` directory, search ATL03:
 
 ```console
-nasa-catalog-collect --output nasa-catalog
-nasa-catalog-export nasa-catalog --output nasa-products.csv
+nasa-eo search nasa-catalog --short-name ATL03 --output atl03-files
 ```
 
-Open `nasa-products.csv` in a spreadsheet to inspect products and their candidate
-search terms. To search for a term you have selected, run:
+Put your raw OpenAI API key in `./secrets/openai.key`, as described below. Replace
+`YOUR_MODEL` with a model identifier available to your API account that supports
+Responses structured outputs. Then classify the saved matches:
 
 ```console
-nasa-repo-search ATL03 --output atl03-search
+nasa-eo classify atl03-files --model YOUR_MODEL --api-key-file ./secrets/openai.key --output atl03-classified
 ```
 
-Use a new output directory or CSV filename for each run. Run any command with
-`--help` to see its options.
+Open `atl03-files/matches.csv` to see the search hits and
+`atl03-classified/classified-matches.csv` to see GPT's assessments. Classification
+automatically gathers nearby code; there is no separate preparation command.
 
-## Collect the NASA product catalog
+## 1. Collect datasets
 
-Save the public collections tagged for NASA's Earth Observing System Data and
-Information System (EOSDIS) in the Common Metadata Repository (CMR):
+For a new catalog, use a new output directory:
 
 ```console
-nasa-catalog-collect --output nasa-catalog
+nasa-eo catalog --output nasa-catalog
 ```
 
-Choose a new output directory. The command retrieves successive catalog pages
-and prints the collection and product counts as it runs.
+This queries NASA's Common Metadata Repository (CMR) for public collections
+tagged for the Earth Observing System Data and Information System (EOSDIS).
+A collection describes a dataset version. Collections sharing the same provider
+and exact short name become one dataset row.
 
-| File | Contents |
+For a small collection instead:
+
+```console
+nasa-eo catalog --short-name ATL03 --output catalog-atl03
+```
+
+| Output | Contents |
 | --- | --- |
-| `collections.jsonl` | Original collection records, each with its request URL, retrieval time, and page number. Written as pages arrive. |
-| `products.jsonl` | One product per provider and exact short name, with its collection versions, titles, descriptions, identifiers, and candidate search terms. Written when collection ends. |
-| `summary.json` | Catalog scope, request URL, timestamps, reported totals, saved counts, warnings, and run status. |
+| `datasets.csv` | One row per provider/short-name dataset, combining its collected versions. |
+| `products.jsonl` | Grouped metadata and candidate identifiers used by the search command. |
+| `collections.jsonl` | Original collection records with request URLs and retrieval times. |
+| `summary.json` | Catalog scope, status, counts, warnings, and errors. |
 
-JSON Lines (`.jsonl`) files contain one JSON object per line. A collection is a
-dataset version. Collections with the same provider and exact short name are
-grouped into one product. Each product includes candidate search terms drawn
-from its identifiers, with the source of each term recorded. Terms start with
-the review status `unreviewed`; inspect them for ambiguity before searching.
+The dataset table contains `provider`, `short_name`, `dataset_name`,
+`description`, `source_url`, `known_from`, `candidate_search_terms`, and
+`candidate_sources`. The source URL is the saved catalog request; candidate
+sources identify the collection and metadata field supplying each term.
 
-For a small trial run, filter to one product and request one record per page:
-
-```console
-nasa-catalog-collect --short-name ATL03 --page-size 1 --output catalog-atl03
-```
-
-`--page-size` accepts 1–2000 records (default: 500). `--timeout` sets the socket
-connection/read timeout in seconds (default: 30). `--ca-bundle` uses the
-certificate settings described below.
-
-Check `summary.json` before using the catalog:
-
-| Status | Meaning | Exit code |
-| --- | --- | --- |
-| `complete` | Collection finished and the saved count matches NASA's reported total. | 0 |
-| `incomplete` | Counts or page results were inconsistent. See `warnings`. | 4 |
-| `failed` | A request, response, or output-file error stopped the run. See `error`. | 1 |
-| `interrupted` | Collection was interrupted with Ctrl+C. | 130 |
-| `running` | Collection is active, or the process stopped before recording a final status. | — |
-
-After a connection failure or Ctrl+C, you can inspect the results saved so far.
-Rerun in a new directory to collect a fresh catalog. Check terminal errors as
-well as `summary.json`, especially after a file-writing failure.
-
-Coverage is the public EOSDIS-tagged CMR catalog at retrieval time, with an
-optional short-name filter. Records can change during collection; check the run
-status before using the results.
-
-## Export the catalog to CSV
-
-Create a spreadsheet-readable table from a saved catalog:
+To export a table from an existing catalog without contacting NASA again:
 
 ```console
-nasa-catalog-export nasa-catalog --output nasa-products.csv
+nasa-eo catalog --from nasa-catalog --output nasa-datasets.csv
 ```
 
-The command reads `products.jsonl` and `summary.json` from the catalog directory.
-Choose a new output filename in an existing directory. Each product becomes one
-CSV row; the terminal reports the exported count and the source catalog status.
+The CSV filename must be new. The search command reads the saved catalog
+**directory**, not this CSV, so there is no spreadsheet selection step.
 
-Open the CSV in your spreadsheet application. In Excel, use **Data → From
-Text/CSV**, select UTF-8 and a comma delimiter, and import identifiers such as
-`short_name` as Text to preserve their spelling. Enable Wrap Text to view the
-multiline cells.
+Check the catalog's `summary.json`. `complete` means collection finished with
+consistent counts; `incomplete`, `failed`, and `interrupted` describe partial
+results. Their status and warnings remain visible in exported metadata. A fresh
+collection requires a new directory. Catalog coverage is the selected public
+EOSDIS-tagged CMR records at collection time, not every NASA dataset.
 
-The columns include:
+## 2. Search public code
 
-- `provider`, `short_name`, and `collection_count` for filtering products.
-- `collection_titles`, `collection_descriptions`, `collection_versions`,
-  `collection_concept_ids`, and `collection_entry_ids`. Entries are numbered
-  `[1]`, `[2]`, and so on in the original collection order. The same number refers
-  to the same collection across these columns. A numbered blank means the value
-  was absent from the catalog.
-- `candidate_search_terms`, `candidate_review_statuses`, and `candidate_sources`.
-  These use their own shared numbering. Each source identifies the collection
-  concept ID and metadata field that supplied that term.
-- `source_catalog_directory` and the `catalog_*` columns for source status,
-  scope, request URL, run times, warnings, and errors.
-
-Check `catalog_status` when reviewing the CSV. Exports of incomplete, failed, or
-interrupted catalogs contain the products saved so far and carry a warning.
-Wait for a `running` catalog to finish before exporting. An empty catalog
-produces a CSV containing only column headings.
-
-Some values have a visible `Text: ` prefix so spreadsheets treat them as text.
-The original values are in `products.jsonl`. If the exporter reports a cell-size
-warning, consult that file for the full value if your spreadsheet truncates it.
-
-Exit code 0 means export succeeded, including an export of a partial catalog.
-Exit code 1 means invalid catalog data or a file error; 130 means interruption.
-For a count-mismatch or invalid-data error, check the source catalog's
-`summary.json` and `products.jsonl`. For a file error, check the destination
-directory and choose an unused output filename.
-
-## Collect repository matches
-
-Search for a product identifier and save the results:
+With no product filter, search uses every collected dataset and all of its saved
+candidate identifiers. Preview the query count before starting a full catalog:
 
 ```console
-nasa-repo-search ATL03 --output atl03-search
+nasa-eo search nasa-catalog --output nasa-files --dry-run
+nasa-eo search nasa-catalog --output nasa-files
 ```
 
-Choose a new output directory for each run. It contains:
+`--dry-run` prints the dataset count, distinct query count, and scope without
+making searches or writing files. There is no default twenty-query limit;
+a full catalog can produce many thousands of queries.
 
-| File | Contents |
-| --- | --- |
-| `matches.jsonl` | One JSON object per returned match, including the query, repository, file, revision, and matching lines. |
-| `events.jsonl` | Search progress, warnings, and completion messages from Sourcegraph. |
-| `summary.json` | Query, run times, saved-record count, number of repositories with matches, and completion status. |
-
-Matches are written as they arrive. The terminal shows the number of saved
-records and distinct repositories containing matches.
-
-The search includes public GitHub repositories, forks, and archived repositories
-in Sourcegraph's index. Add `--all-hosts` to include other indexed public hosts:
+Use repeatable exact short-name filters for a smaller run:
 
 ```console
-nasa-repo-search ATL03 --all-hosts --output atl03-all-hosts
+nasa-eo search nasa-catalog --short-name ATL03 --short-name ATL06 --output ice-files
 ```
 
-Searches are case-insensitive. Product terms are matched at line boundaries or
-separators such as spaces, quotes, underscores, dots, slashes, and hyphens.
-For example, `ATL03` matches `ATL03_007`, `ATL03.h5`, and `test_atl03`.
-Punctuation within the search phrase is treated literally.
+Each selected dataset contributes its collected short name, entry identifiers,
+and collection concept identifiers. Identical terms shared by datasets are
+searched once and associated with each dataset. The query treats each term as
+literal text with non-alphanumeric boundaries: `ATL03` can match `ATL03_007` or
+`test_atl03`, but not `MATL03`. Matching is case-insensitive.
 
-The command collects the results returned by Sourcegraph for its indexed
-content. Follow the matching files to see how each product is used.
+This is identifier matching, not semantic search. The software does not invent
+download URLs, filename patterns, or other signatures absent from the saved
+catalog. A hit can still mean something unrelated to NASA.
 
-### Run status
+Searches cover **public GitHub content in Sourcegraph's index**, including forks
+and archived repositories. Add `--all-hosts` to include other indexed public
+code hosts. Neither setting searches every public repository. Queries run
+sequentially; Sourcegraph's time or result limits are recorded, not treated as
+proof of complete GitHub coverage.
 
-Check `summary.json` after a search:
+### Search output and completion
 
-| Status | Meaning | Exit code |
-| --- | --- | --- |
-| `finished_no_reported_limits` | Sourcegraph reported completion with no search-limit warnings. | 0 |
-| `incomplete` | The search returned warnings or ended before reporting completion. Inspect `events.jsonl`. | 4 |
-| `failed` | A connection, response, or file error stopped collection. Previously saved matches remain available. | 1 |
-| `interrupted` | The search was interrupted with Ctrl+C. Previously saved matches remain available. | 130 |
-| `running` | Collection is active, or the process stopped before writing its final summary. | — |
+`matches.csv` has one row per **dataset, repository, file, and commit**. Multiple
+matching lines, search terms, and repeated attempts are combined in that row;
+different revisions remain separate. Its columns are:
 
-The search timeout is 60 seconds; a connection or read can wait up to 65 seconds.
+- `match_id`, `provider`, `short_name`, `dataset_name`.
+- `repository`, `file`, `commit`, `line_numbers`, `snippet`, `source_url`.
+- `search_terms`, `search_complete`, `warnings`.
 
-## Search a selected group of products
+`searches.csv` includes every dataset/query association, including queries with
+no hits. `summary.json` gives overall counts and status. `plan.json` preserves
+the selected terms and their sources; `searches/` retains original attempt data.
 
-Create a CSV containing the products you want to search. Use the exact `provider`
-and `short_name` values from your catalog. For example, save this as `pilot.csv`:
-
-```csv
-provider,short_name,search_term
-NSIDC_CPRD,ATL03,ATL03
-NSIDC_CPRD,ATL06,ATL06
-```
-
-`search_term` is optional and defaults to the product's short name. Each term must
-be one of that product's catalog candidates. You can also save selected rows from
-the catalog export as a new CSV: extra columns are accepted. Add `search_term`
-to choose an identifier other than the short name. Selecting a term records your
-choice in the batch plan and preserves its catalog review status and sources.
-
-Start the batch:
-
-```console
-nasa-repo-batch start nasa-catalog --selection pilot.csv --output pilot-search
-```
-
-The command validates the whole selection before searching. It defaults to at
-most 20 distinct terms; use `--max-searches 50` to allow a larger selection.
-Identical terms shared by products are searched once and linked to each selected
-product. Searches run sequentially with a one-second pause between requests.
-Progress shows the query number, term, attempt, and saved match counts.
-
-The search covers public GitHub content in Sourcegraph's index, including forks
-and archives. Add `--all-hosts` when starting a batch to include other indexed
-public code hosts. Each query has the same timeouts and term matching as
-`nasa-repo-search`. Inspect the matched code to establish product use.
-
-### Inspect batch results
-
-| File | Contents |
-| --- | --- |
-| `plan.json` | Selected terms, associated products and catalog sources, query scope, and source catalog status. |
-| `searches.csv` | One row per product/query with the latest attempt's status, match count, warnings, and errors. Includes searches with zero matches. |
-| `matches.csv` | Product-linked file matches, repository/owner, stars when available, file type, language, revision, matching text, and GitHub file links. |
-| `summary.json` | Batch status, counts by query status, and CSV row counts. |
-| `searches/<search-id>/attempt-000001/` | Original `matches.jsonl`, `events.jsonl`, and `summary.json` for each attempt. |
-
-Reports refresh after each query; save a copy if you add your own review notes.
-`matches.csv` retains matches from all attempts;
-filter `latest_attempt` to `true` for the current results. Use `attempt_status` to
-distinguish completed searches from partial results. Matching text includes
-one-based line numbers. Multiple product associations and repeated attempts can
-produce multiple rows for the same file. CSV fields use the same text protection
-as the catalog export.
-
-### Stop and resume
-
-Press Ctrl+C to stop. Resume using the saved batch directory:
-
-```console
-nasa-repo-batch resume pilot-search
-```
-
-Resume uses `plan.json`, so the original catalog and selection CSV can be moved
-after the batch starts. Verified completed searches are skipped. Pending,
-incomplete, failed, or interrupted queries are searched again from the beginning,
-once per resume, in new attempt directories. Earlier attempts remain available.
-To change the selected terms or scope, start a new batch directory.
-
-| Search status | Meaning |
+| Query status | Meaning |
 | --- | --- |
 | `pending` | The query has not started. |
-| `finished_no_reported_limits` | Sourcegraph reported completion with no warnings, and saved evidence passed validation. |
-| `incomplete` | Sourcegraph reported limits or ended before confirming completion. |
-| `failed` | A request/file error occurred, or saved evidence was missing or damaged. See `error` in `searches.csv`. |
-| `interrupted` | The search was stopped, or its previous process exited before finalizing the attempt. |
+| `finished_no_reported_limits` | The service confirmed completion without reported limits, and saved evidence passed validation. |
+| `incomplete` | Limits were reported or the stream ended before confirmed completion. |
+| `failed` | A request, file, or saved-evidence validation error occurred. |
+| `interrupted` | Processing stopped before the attempt finished. |
 
-Batch exit codes are 0 when all queries completed, 4 for incomplete results,
-1 for input/file errors or failed queries, and 130 for interruption. Check the
-terminal and `summary.json` after each run. A file-writing failure can leave the
-previous report snapshot in place. Close a CSV in your spreadsheet application
-if it prevents a report from being updated, then resume the batch.
+`search_complete=true` means all selected queries for that dataset finished
+without reported limits. It does not mean all GitHub repositories were searched.
+A missing match is not proof that no repository uses the dataset.
 
-One process can run in a batch directory at a time. `batch.lock` is released by
-the operating system when the process exits; the file stays in place for reuse.
-Both subcommands accept `--ca-bundle PATH`; Sourcegraph authentication uses
-`SOURCEGRAPH_TOKEN` as described below.
+Press Ctrl+C to stop. Repeat the same search command and output directory to
+resume: verified completed queries are skipped, and unfinished queries are
+retried from the beginning in new attempt directories. Older results remain
+available. Keep the source catalog unchanged; use a new output directory to
+change the dataset selection or search scope.
 
-## Classify repository/product evidence
+## 3. Classify matching files
 
-Use the saved batch directory and its source catalog to prepare evidence:
-
-```console
-nasa-evidence-classify prepare pilot-search --catalog nasa-catalog --output pilot-review
-```
-
-The input is the **batch directory**, containing `plan.json` and the original
-search-attempt files. The command groups matches by repository, provider, and
-product. Repeated matches across attempts and search terms contribute evidence
-once, with their original sources retained. Older revisions remain distinguishable.
-Products with no returned matches have no repository row; inspect the batch's
-`searches.csv` for those products.
-
-Preparation reads catalog titles, descriptions, versions, and identifiers. It
-fetches public GitHub files at the saved commit and selects ten lines before and
-after each match, plus the first 80 lines of an available README at that commit.
-Downloads are capped at 2 MB and cached during preparation. Source URLs and code
-are treated as data; only validated, commit-pinned GitHub raw-file URLs are fetched.
-Missing context, unsupported hosts/revisions, and partial searches appear as
-warnings. Your original catalog and search results stay unchanged.
-
-Preparation makes no OpenAI calls and needs no API key. Add `--offline` to use
-only the saved matching lines, without GitHub requests. Choose a new output
-directory for each preparation. Interrupting preparation leaves the original
-inputs available; run preparation again in a new directory.
-
-Open `pilot-review/review.csv` to inspect the groups and warnings. `plan.json`
-contains the original evidence, readable evidence blocks, and planned requests.
-Nearby code stays together, and notebook source text is decoded into readable
-excerpts with source locations. Identical blocks share their text while retaining
-their source occurrences in the audit data. Repository and product descriptions
-are compact; README background accompanies matches rather than getting its own
-classification request. Any unavailable or omitted context remains explicit.
-
-Groups that fit are sent together. Larger groups are split into packets of at
-most 24,000 UTF-8 JSON bytes, retaining matched text and splitting oversized
-blocks when necessary. Five repository/product groups can still require more
-than five API calls. A request limit counts calls, not CSV rows.
-
-Use `--context-lines 20` to change the surrounding-code window (0–100), or
-`--packet-bytes 48000` to change the evidence packet cap (minimum 4096).
-If the metadata and one fragment cannot fit, that group is marked `blocked`;
-increase the packet cap and prepare a new directory. Packet size is measured in
-bytes, not model tokens, and must fit the selected model's input limits.
-
-### Reuse saved evidence with the current format
-
-New preparations use format 2 and prompt `repository-product-v2`. To rebuild
-inputs from an existing format-1 or format-2 preparation:
+The input is a saved search directory, not a CSV. You can also use an existing
+`nasa-repo-batch` result such as `pilot-search`:
 
 ```console
-nasa-evidence-classify repack pilot-review --output pilot-review-v2
-nasa-evidence-classify run pilot-review-v2 --model YOUR_MODEL --dry-run
+nasa-eo classify pilot-search --catalog nasa-catalog --model YOUR_MODEL --api-key-file ./secrets/openai.key --output pilot-file-classifications
 ```
 
-`repack` reads saved excerpts only: it makes no GitHub or OpenAI requests, needs
-no key, and leaves the source directory unchanged. It preserves the original
-catalog and match provenance, but cannot recover code that was never collected.
-Choose a new output directory; `--packet-bytes` sets the same size cap as in
-`prepare`.
+You do not need to rerun NASA collection or repository searches. `--catalog`
+is optional when the catalog still exists at the location saved in the search
+plan. Use a new classification output directory; older repository-level
+judgments are not reused as judgments about individual files.
 
-Old CSVs and receipts remain available. The current `run` command requires a
-format-2 preparation and will reject format 1 before reading a key or writing
-files. Repacked inputs require new classifications: old paid responses are not
-copied or treated as answers to the changed requests.
+For each matched file and revision, the command collects nearby public GitHub
+code at that commit and a bounded README excerpt for background. It sends the
+file's evidence and dataset metadata to OpenAI. Other matching files are assessed
+separately. No repository code is executed. Unavailable context remains explicit.
 
-### Preview API work and set your key
-
-Choose an OpenAI model that supports the Responses API with
-[Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses).
-Replace `YOUR_MODEL` in these examples with its model identifier:
+Preview classification work first if desired:
 
 ```console
-nasa-evidence-classify run pilot-review --model YOUR_MODEL --dry-run
+nasa-eo classify atl03-files --model YOUR_MODEL --output atl03-classified --dry-run
 ```
 
-This prints cached and eligible request counts, request JSON bytes, and the
-maximum generated tokens for the next invocation. It makes no API calls, needs
-no key, and does not change the prepared files. The byte count is not a token or
-price estimate; API cost depends on the selected model and actual token usage.
+A new-run preview uses saved snippets only, so downloaded context can change its
+request count. A dry run makes no downloads or model calls, reads no key, and
+writes no output. **`--offline` is different:** it skips public-code downloads
+but still sends saved snippets to GPT and can incur API charges.
 
-Create `secrets/openai.key` in the directory where you run the command. Save
-**only your raw API key** in this UTF-8 text file: one line, without quotes,
-JSON, or an `OPENAI_API_KEY=` prefix. A trailing newline is accepted. No
-environment variable is required. To choose a different location explicitly:
+By default classification processes all eligible requests. To limit new API
+calls for one invocation, add `--max-requests 5`. This counts requests, not files;
+a large file can need several evidence packets and API calls. A limit can leave
+rows pending even when every submitted request succeeded.
 
-```console
-nasa-evidence-classify run pilot-review --model YOUR_MODEL --api-key-file ./secrets/openai.key --max-requests 5
-```
+Repeat the same classification command to continue. Valid successful responses
+are reused. Keep the saved search/catalog unchanged and use the same model and
+output-token settings. Context options apply when creating a new output; resumed
+runs reuse their frozen excerpts. Use a new directory to change the evidence.
 
-Credentials are checked in this order:
+A failed request stops the invocation. Ordinary resume can process other
+unstarted requests; inspect errors before explicitly retrying failed or uncertain
+requests with `--retry-failed`. An interrupted request may already have been
+processed by OpenAI, so retrying it can incur another charge.
 
-1. The file selected with `--api-key-file PATH`.
-2. A nonblank `OPENAI_API_KEY` environment variable, when no file is selected.
-3. `./secrets/openai.key`, relative to the current working directory.
+### Read the classification table
 
-An explicitly selected file must be readable and valid; the command reports an
-error instead of falling back to another credential. Files may contain at most
-4096 bytes. Preparation, `--dry-run`, and fully cached runs do not read the key.
-Key contents and the selected file path are not saved in plans or request receipts,
-so you can change the credential location when resuming.
+`classified-matches.csv` retains the original match columns and adds `status`,
+`category`, `explanation`, `gpt_model`, `evidence_citations`, and `error`.
+It remains one row per dataset/repository/file/commit, not one row per repository.
 
-The repository ignores `secrets/`, `secretes/`, and `*.key` files in Git. The
-file is still plaintext: restrict access to your account, keep it out of shared
-folders, and never commit or paste the key into logs or issues. For a custom
-filename outside those ignored paths, add your own ignore rule. Git ignore rules
-do not protect files that were already tracked.
-
-Running classification sends the prepared public-code excerpts and NASA metadata
-to OpenAI. The credential is sent only to the OpenAI endpoint and is not written
-to receipts.
-Requests use `store: false`; inspect your API project's data settings as well.
-
-### Run and resume classification
-
-Start with a small request limit:
-
-```console
-nasa-evidence-classify run pilot-review --model YOUR_MODEL --max-requests 5
-```
-
-Repeat the same command to continue. Successful saved responses are validated
-and reused. `--max-requests` limits new calls **per invocation** (default: 20).
-Stopping at that limit can leave assessments pending even when every submitted
-request succeeded. The terminal reports completed and pending assessments;
-check `summary.json` before treating the whole run as finished.
-`--max-output-tokens` caps generated tokens per call, including reasoning tokens
-(default: 2048; allowed: 256–32768). These are request and output-token limits,
-not a dollar budget. The first run fixes the model and output-token cap for that
-directory; supply the same settings on resume. Prepare a new directory to change
-them or the evidence. Only one process may write to a review directory at a time.
-
-A failed request stops the current invocation. Ordinary resume can process
-remaining unstarted requests, but failed or uncertain requests require an explicit
-retry after you inspect their saved response and error:
-
-```console
-nasa-evidence-classify run pilot-review --model YOUR_MODEL --retry-failed
-```
-
-The command writes a receipt before each call and saves the raw response before
-validating it. A refused, incomplete, malformed, or invalidly cited response is
-reported as a failure. Ctrl+C can leave a request with no saved response even if
-OpenAI processed it; retrying may incur another charge. There are no automatic
-network retries. Both subcommands accept `--ca-bundle PATH`.
-
-### Review the classifications
-
-Each row in `review.csv` assesses one repository/product pair:
-
-| Category | Evidence interpretation |
+| Category | What the collected file evidence establishes |
 | --- | --- |
-| `direct_use` | Application or analysis code explicitly accesses or processes the product. |
-| `supporting_software` | Tools, libraries, tests, fixtures, or examples demonstrate product support. |
-| `reference_only` | Relevant prose or citations mention the product. |
-| `unrelated` | The matching identifier means something else. |
-| `unclear` | Evidence is ambiguous, conflicting, insufficient, or not fully processed. |
+| `direct_use` | Application or analysis code accesses, downloads, or processes the dataset. |
+| `supporting_software` | A tool, library, test, fixture, or example demonstrates dataset support. |
+| `reference_only` | Relevant prose mentions the dataset without demonstrating code use. |
+| `unrelated` | The matching identifier clearly means something else. |
+| `unclear` | Evidence is insufficient or conflicting, or processing is unfinished. |
 
-The CSV includes one concise conclusion, up to three supporting file/line links,
-evidence types, observed product versions, `needs_review`, and explicit review
-reasons. Source-search completeness, context limitations, warnings, and processing
-status remain separate. Classifications concern the product across versions:
-an ATL03 version 003 example is evidence about ATL03, without establishing
-compatibility with version 007. Observed versions require citations to code or
-documentation excerpts, not just catalog metadata.
+Older product versions still count as evidence about that dataset; they do not
+establish compatibility with the newest version. A classification describes the
+supplied excerpts, not everything the repository does or proof of actual execution.
+Evidence links support inspection; a validated citation does not guarantee that
+the model interpreted the code correctly.
 
-The model must cite
-supplied evidence identifiers; those identifiers are checked before accepting a
-response. Check the cited code yourself: a valid citation and a consistent output
-format do not prove that the interpretation is correct or that code was executed.
+Processing `status` is separate: `complete` means all required responses were
+saved and validated; `pending` means work remains; `failed` means a request or
+response failed; `blocked` means usable evidence could not be prepared. Check
+`summary.json` before treating a run as finished. `audit.json` contains full
+explanations and limitations; `plan.json`, `prompt.json`, `settings.json`, and
+`requests/` retain the evidence, settings, and credential-free request receipts.
 
-For split groups, relevant code evidence takes precedence over a prose mention.
-Ambiguous matching evidence or a relevant/unrelated conflict produces `unclear`.
-An unclear packet containing only supplementary context is neutral. Multiple
-packets or a bounded README excerpt alone do not force review. Missing matched
-context, partial searches, conflicting evidence, and model-reported uncertainty
-have explicit review reasons. `reference_only` describes the collected evidence;
-it does not establish that the repository lacks a relevant implementation.
+Optional controls include `--context-lines 20` (default 10),
+`--packet-bytes 48000` (default 24000), and `--max-output-tokens 8192` (default
+2048). Packet bytes are not model tokens; request/output limits are not a dollar
+budget. Choose the same output-token cap when resuming an existing run.
 
-The concise report is assembled from validated packet judgments without an extra
-model call. `audit.json` preserves all packet explanations and citations, including
-qualifications that do not fit in the short CSV conclusion. Check that file when
-reviewing a split or conflicting assessment.
+## Credentials, files, and troubleshooting
 
-| Processing status | Meaning |
-| --- | --- |
-| `pending` | Some packets have not been classified, including after a request limit. |
-| `complete` | Every packet has a saved, validated model response. |
-| `failed` | A request failed validation or has an uncertain outcome. Inspect `error` and the receipt. |
-| `blocked` | No usable matching lines, or metadata/evidence cannot fit the packet cap. |
+Save only the raw API key in the UTF-8 file `./secrets/openai.key`: one line,
+without quotes, JSON, or an `OPENAI_API_KEY=` prefix. A trailing newline is fine.
+Credential lookup uses an explicit `--api-key-file` first; otherwise a nonblank
+`OPENAI_API_KEY` environment variable takes precedence over the default file.
+An invalid explicit file causes an error rather than silently falling back.
+Dry runs and fully cached classifications do not read a key.
 
-`complete` describes model processing. Search coverage remains the public content
-returned by Sourcegraph, and `search_complete` records whether the selected
-product queries finished without reported limits. Neither status guarantees all
-GitHub repositories were searched or that the model's judgment is correct.
+Git ignores `secrets/`, `secretes/`, and `*.key`, but these files are plaintext.
+Restrict access, keep them out of shared folders, and never commit or paste the
+key. Already tracked files are not protected by ignore rules. Key contents and
+the chosen key-file path are not written to saved request receipts.
 
-| File | Contents |
-| --- | --- |
-| `review.csv` | One repository/product row, including blank `human_category` and `human_notes` columns. |
-| `plan.json` | Frozen full source metadata, original line evidence and match provenance, compact blocks with source mappings, and request packets. |
-| `audit.json` | Full packet classifications, source citations, review reasons, and evidence limitations for each assessment. |
-| `prompt.json` | Classification instructions and prompt version used by this preparation. |
-| `settings.json` | Model and output-token cap, saved when classification starts. |
-| `requests/<request-hash>/attempt-000001.json` | Credential-free request, timestamps, raw model response when available, validation result, and error. Retries get new numbered files. |
-| `summary.json` | Group/request counts, processing status, recorded token usage across attempts, and attempts without usage data. |
+CSV reports are quoted UTF-8 with a byte-order mark for spreadsheets. Formula-like
+cells receive a `Text: ` prefix; raw JSON preserves the original text. Combined
+reports refresh at the start and end of each search/classification invocation,
+including Ctrl+C; individual results are saved as they arrive. Copy reports before
+adding personal notes.
+Close an open spreadsheet if it prevents an updated CSV from being written.
 
-Reports refresh during classification. **Save a copy of `review.csv` before adding
-review notes**; subsequent runs regenerate it. Text fields use the same spreadsheet
-protection as the catalog export. Original evidence remains in JSON if a spreadsheet
-truncates a large cell. Prepared files are sufficient to resume after the source
-catalog or batch is moved.
+Commands exit 0 on success or preview, 4 for incomplete/pending/blocked work,
+1 for input/service/file errors, and 130 after interruption. Check terminal
+errors and `summary.json`, especially after a file-writing failure.
 
-Exit code 0 means preparation/repacking/preview succeeded or classification processing
-completed; 4 means pending or blocked work; 1 means invalid inputs, file errors,
-or failed requests; 130 means interruption. Inspect terminal errors as well as
-`summary.json`, especially if an open spreadsheet prevents report replacement.
+All three commands accept `--ca-bundle PATH` for a trusted PEM certificate bundle;
+`SSL_CERT_FILE` is also supported. Sourcegraph authentication uses
+`SOURCEGRAPH_TOKEN`. No OpenAI key is needed for catalog collection or code search.
 
-## Preview one repository match
+If `nasa-eo` is missing from PATH, use `python -m nasa_eo_search.pipeline` with the
+same arguments. Run `nasa-eo --help` or a subcommand's `--help` for options.
 
-Display the first matching file:
-
-```console
-nasa-repo-preview ATL03
-nasa-repo-preview "earthdata.nasa.gov" --all-hosts
-```
-
-The JSON output includes the repository URL, stars when available, file path,
-language, commit, and matching lines. GitHub matches include a link to the file
-at the reported revision. The command exits after the first file arrives.
-Its default scope is active, non-fork public repositories in Sourcegraph's index.
-
-Save the preview by redirecting standard output:
-
-```console
-nasa-repo-preview ATL03 > first-repository.json
-```
-
-Progress and errors go to standard error. Exit code 3 means the search returned
-no matching file. The server timeout is 15 seconds and the socket timeout is
-20 seconds.
-
-## Look up a NASA product
-
-```console
-nasa-product-preview --short-name ATL03
-```
-
-This queries NASA's Common Metadata Repository (CMR) for one collection tagged
-for the Earth Observing System Data and Information System (EOSDIS). A collection
-describes a dataset and version. The output contains its title, description,
-version, provider, and identifiers that can be used as code-search terms.
-Each term records the catalog field it came from.
-
-Omit `--short-name` to return the first collection selected by CMR. Use
-`--timeout 10` to set the connection/read timeout in seconds; the default is 20.
-Exit code 3 means the catalog returned no matching collection.
-
-## Run a custom Sourcegraph query
-
-Use `sourcegraph-search` to supply filters and patterns directly:
-
-```console
-sourcegraph-search --trace "repo:^github.com/ ATL03 lang:Python count:100 timeout:30s"
-```
-
-Results are JSON Lines on standard output. `--trace` prints received event types
-to standard error; `--raw-events` writes all decoded events to standard output.
-See the [Sourcegraph query syntax](https://sourcegraph.com/docs/code-search/queries)
-for available filters.
-
-## Connection settings
-
-For Sourcegraph authentication, set `SOURCEGRAPH_TOKEN`. The
-`sourcegraph-search` command also accepts `--endpoint` for another instance.
-
-HTTPS connections use Certifi's certificate authority bundle. If your network
-requires a private certificate authority, provide its PEM file with
-`--ca-bundle PATH` or the `SSL_CERT_FILE` environment variable.
-
-If a command is missing from PATH, use the Python module in your installed
-environment, for example:
-
-```console
-python -m nasa_eo_search.repo_search ATL03 --output atl03-search
-```
-
-Use these module names with `python -m`, followed by the same command arguments:
-
-| Command | Module |
-| --- | --- |
-| `nasa-catalog-collect` | `nasa_eo_search.catalog` |
-| `nasa-catalog-export` | `nasa_eo_search.catalog_csv` |
-| `nasa-repo-search` | `nasa_eo_search.repo_search` |
-| `nasa-repo-batch` | `nasa_eo_search.repo_batch` |
-| `nasa-evidence-classify` | `nasa_eo_search.evidence_classify` |
-| `nasa-repo-preview` | `nasa_eo_search.repo_preview` |
-| `nasa-product-preview` | `nasa_eo_search.cmr` |
-| `sourcegraph-search` | `nasa_eo_search.sourcegraph` |
+The lower-level commands remain available: `nasa-catalog-collect`,
+`nasa-catalog-export`, `nasa-repo-search`, `nasa-repo-batch`,
+`nasa-evidence-classify`, `nasa-product-preview`, `nasa-repo-preview`, and
+`sourcegraph-search`. Use their `--help` when working with their existing outputs.

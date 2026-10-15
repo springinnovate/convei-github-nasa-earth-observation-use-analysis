@@ -7,30 +7,80 @@ from nasa_eo_search.evidence_inputs import serialize_evidence
 from nasa_eo_search.evidence_notebooks import decode_saved_notebook_line
 
 
-def reassemble_evidence_lines(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def separate_conflicting_line_fragments(
+    fragments: list[dict[str, Any]], original_lines: list[str],
+) -> tuple[list[list[dict[str, Any]]], bool]:
+    """Keep fragments from contradictory saved lines out of the same text variant.
+
+    Args:
+        fragments: Raw citations for one file, revision, line number, and kind.
+        original_lines: Complete saved matching-line alternatives, when available.
+
+    Returns:
+        Independently reassemblable fragment groups and whether offsets conflict.
+        Original text is used only to associate existing fragments, never to fill
+        missing characters. Unassignable fragments remain separate and unchanged.
+    """
+    texts_by_offset: dict[int, set[str]] = defaultdict(set)
+    for fragment in fragments:
+        texts_by_offset[fragment.get("character_offset", 0)].add(fragment["text"])
+    conflicts = len(set(original_lines)) > 1 or any(len(texts) > 1 for texts in texts_by_offset.values())
+    if not conflicts:
+        return [fragments], False
+    fragment_groups = []
+    assigned_ids = set()
+    for original_line in sorted(set(original_lines)):
+        matching_fragments = []
+        for fragment in fragments:
+            offset = fragment.get("character_offset", 0)
+            if original_line[offset:offset + len(fragment["text"])] == fragment["text"]:
+                matching_fragments.append(fragment)
+                assigned_ids.add(fragment["evidence_id"])
+        if matching_fragments:
+            fragment_groups.append(matching_fragments)
+    fragment_groups.extend([fragment] for fragment in fragments if fragment["evidence_id"] not in assigned_ids)
+    return fragment_groups, True
+
+
+def reassemble_evidence_lines(
+    evidence: list[dict[str, Any]], matching_files: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Rejoin saved line fragments without repeating per-fragment metadata.
 
     Args:
         evidence: Raw evidence records retained unchanged in the saved plan.
+        matching_files: Optional saved files with complete matching-line text,
+            used to distinguish contradictory alternatives at one source location.
 
     Returns:
         Ordered line records with all raw citation IDs and character offsets.
         Missing character ranges remain separate records rather than being joined.
+        Conflicting variants without original provenance remain separate fragments.
     """
+    original_lines_by_location: dict[tuple[str, str, int], list[str]] = defaultdict(list)
+    for file_record in matching_files or []:
+        for matching_line in file_record.get("matching_lines", []):
+            original_lines_by_location[(file_record["file"], file_record.get("commit") or "",
+                                        matching_line["line_number"])].append(matching_line["text"])
     fragments_by_line = defaultdict(list)
     for item in evidence:
         fragments_by_line[(item["file"], item["commit"] or "", item["line_number"], item["kind"])].append(item)
     lines = []
-    for unused_identity, fragments in sorted(fragments_by_line.items()):
-        current_line = None
-        for fragment in sorted(fragments, key=lambda item: item.get("character_offset", 0)):
-            offset = fragment.get("character_offset", 0)
-            if current_line is None or current_line["character_offset"] + len(current_line["text"]) != offset:
-                current_line = {name: fragment[name] for name in ("repository", "file", "commit", "line_number", "kind")}
-                current_line.update(text="", character_offset=offset, source_ids=[])
-                lines.append(current_line)
-            current_line["text"] += fragment["text"]
-            current_line["source_ids"].append(fragment["evidence_id"])
+    for line_identity, fragments in sorted(fragments_by_line.items()):
+        original_lines = original_lines_by_location.get(line_identity[:3], []) if line_identity[3] == "matching_line" else []
+        fragment_groups, conflicting_fragments = separate_conflicting_line_fragments(fragments, original_lines)
+        for fragment_group in fragment_groups:
+            current_line = None
+            for fragment in sorted(fragment_group, key=lambda item: item.get("character_offset", 0)):
+                offset = fragment.get("character_offset", 0)
+                if current_line is None or current_line["character_offset"] + len(current_line["text"]) != offset:
+                    current_line = {name: fragment[name] for name in ("repository", "file", "commit", "line_number", "kind")}
+                    current_line.update(text="", character_offset=offset, source_ids=[])
+                    if conflicting_fragments:
+                        current_line["conflicting_fragments"] = True
+                    lines.append(current_line)
+                current_line["text"] += fragment["text"]
+                current_line["source_ids"].append(fragment["evidence_id"])
     return lines
 
 
@@ -58,7 +108,7 @@ def build_readable_evidence_blocks(group: dict[str, Any]) -> list[dict[str, Any]
         Readable matched-code blocks with deterministic short citation IDs.
         Material notebook decoding limitations are added to evidence_gaps.
     """
-    lines = reassemble_evidence_lines(group["evidence"])
+    lines = reassemble_evidence_lines(group["evidence"], group.get("files"))
     decoded_lines = {(entry["file"], entry["commit"], number)
                      for entry in group.get("notebook_decoded_lines", []) for number in entry["line_numbers"]}
     blocks = [{**cell, "source_ids": list(cell["source_ids"])} for cell in group.get("notebook_cells", [])]
@@ -69,6 +119,9 @@ def build_readable_evidence_blocks(group: dict[str, Any]) -> list[dict[str, Any]
             continue
         line_text = line["text"]
         representation = "source_lines"
+        if line.get("conflicting_fragments"):
+            gaps.add(f"{line['file']}:{line['line_number']}: saved matches disagree at this revision and line; "
+                     "original variants are kept separate, or fragments remain separate when their origin is uncertain.")
         if line["character_offset"]:
             gaps.add(f"{line['file']}:{line['line_number']}: source line starts at character offset "
                      f"{line['character_offset']}; missing earlier characters were not reconstructed.")

@@ -11,6 +11,7 @@ from nasa_eo_search.batch_files import (
 )
 from nasa_eo_search.catalog_csv import protect_spreadsheet_cell
 from nasa_eo_search.repo_preview import format_repository_match
+from nasa_eo_search.pipeline_tables import FILE_MATCH_COLUMNS, collapse_batch_file_rows
 
 
 ASSOCIATION_COLUMNS = ("provider", "short_name", "search_term", "search_id", "query")
@@ -49,9 +50,9 @@ def write_batch_reports(
     """Refresh batch status and combined CSVs from all preserved attempts.
 
     searches.csv has one row per product/query using the latest attempt's status.
-    matches.csv includes every readable match from every attempt, associated with
-    each selected product. Historical attempts are labeled for filtering. Publish
-    summary.json last, after both CSVs are successfully written.
+    Legacy matches.csv includes every readable attempt match. File-report plans
+    merge repeated hits into one row per product/file/revision, retaining all
+    snippets. Publish summary.json last, after both CSVs are successfully written.
 
     Args:
         output_directory: Existing batch root.
@@ -99,6 +100,7 @@ def write_batch_reports(
                         "file_type": PurePosixPath(match["file"]).suffix,
                         "language": match["language"], "commit": match["commit"], "file_url": match["file_url"],
                         "matching_text": "\n".join(f"{line['line_number']}: {line['text']}" for line in match["matching_lines"]),
+                        "matching_lines": match["matching_lines"], "dataset_name": product.get("dataset_name", ""),
                         "interpretation": match["interpretation"],
                     })
     status = "complete"
@@ -116,7 +118,12 @@ def write_batch_reports(
         "product_query_rows": len(status_rows), "match_rows_all_attempts": len(match_rows),
     }
     write_protected_csv_rows(output_directory / "searches.csv", STATUS_COLUMNS, status_rows)
-    write_protected_csv_rows(output_directory / "matches.csv", MATCH_COLUMNS, match_rows)
+    if plan.get("report_unit") == "file":
+        file_rows = collapse_batch_file_rows(match_rows, status_rows, plan["catalog_summary"]["status"] == "complete")
+        summary["file_match_rows"] = len(file_rows)
+        write_protected_csv_rows(output_directory / "matches.csv", FILE_MATCH_COLUMNS, file_rows)
+    else:
+        write_protected_csv_rows(output_directory / "matches.csv", MATCH_COLUMNS, match_rows)
     with atomic_batch_output(output_directory / "summary.json") as summary_output:
         json.dump(summary, summary_output, indent=2)
     return summary

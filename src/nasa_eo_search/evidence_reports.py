@@ -11,6 +11,7 @@ from nasa_eo_search.batch_files import atomic_batch_output
 from nasa_eo_search.batch_reports import write_protected_csv_rows
 from nasa_eo_search.evidence_inputs import identify_evidence, read_evidence_json, serialize_evidence
 from nasa_eo_search.evidence_model import PROMPT_VERSION, build_classification_request, parse_classification_response
+from nasa_eo_search.pipeline_tables import FILE_MATCH_COLUMNS
 
 
 REVIEW_COLUMNS = (
@@ -19,6 +20,7 @@ REVIEW_COLUMNS = (
     "file_count", "packet_count", "completed_packets", "search_complete",
     "warnings", "error", "model", "prompt_version", "group_id", "human_category", "human_notes",
 )
+FILE_CLASSIFICATION_COLUMNS = (*FILE_MATCH_COLUMNS, "status", "category", "explanation", "gpt_model", "evidence_citations", "error")
 MAX_SUMMARY_CHARACTERS = 800
 MAX_SUMMARY_CITATIONS = 3
 CATEGORY_PRIORITY = {category: number for number, category in enumerate(
@@ -55,12 +57,20 @@ def load_evidence_plan(output_directory: Path) -> dict[str, Any]:
     """
     envelope = read_evidence_json(output_directory / "plan.json")
     plan = envelope.get("data")
-    if envelope.get("schema_version") != 2 or (isinstance(plan, dict) and plan.get("prompt_version") != PROMPT_VERSION):
-        raise ValueError("This run needs evidence format 2 and repository-product-v2. Existing results are unchanged; "
+    schema_version = envelope.get("schema_version")
+    if type(schema_version) is not int or schema_version not in (2, 3) or (isinstance(plan, dict) and plan.get("prompt_version") != PROMPT_VERSION):
+        raise ValueError("This run needs evidence format 2 or file format 3 and repository-product-v2. Existing results are unchanged; "
                          "use nasa-evidence-classify repack SOURCE --output NEW, or prepare a new directory.")
     if (not isinstance(plan, dict) or envelope.get("plan_id") != identify_evidence(plan)
             or not isinstance(plan.get("groups"), list)):
         raise ValueError("Prepared plan is invalid or changed; prepare a new directory.")
+    if schema_version == 3:
+        if (plan.get("assessment_unit") != "file" or not isinstance(plan.get("source_evidence_id"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", plan["source_evidence_id"])
+                or any(not isinstance(plan.get(field), str) or not plan[field] for field in ("batch_directory", "catalog_directory"))):
+            raise ValueError("Invalid file-classification source identity.")
+    elif plan.get("assessment_unit") == "file":
+        raise ValueError("File assessments require schema version 3; repository-level results cannot be reused as file judgments.")
     seen_groups = set()
     for group in plan["groups"]:
         if (not isinstance(group, dict) or not isinstance(group.get("product"), dict)
@@ -68,11 +78,62 @@ def load_evidence_plan(output_directory: Path) -> dict[str, Any]:
                 or not isinstance(group.get("evidence_blocks"), list)):
             raise ValueError("Malformed prepared evidence group.")
         expected_id = identify_evidence([group.get("repository"), group["product"].get("provider"), group["product"].get("short_name")])
+        if schema_version == 3:
+            expected_id = validate_file_assessment_group(group)
         if group.get("group_id") != expected_id or expected_id in seen_groups:
             raise ValueError("Invalid or duplicate evidence group identity.")
         seen_groups.add(expected_id)
         validate_prepared_blocks(group)
     return plan
+
+
+def validate_file_assessment_group(group: dict[str, Any]) -> str:
+    """Require file-level identity and citations without importing other matched files.
+
+    Args:
+        group: One file-level group from a schema-version-3 plan.
+
+    Returns:
+        Expected stable dataset/repository/file/revision match identifier.
+
+    Raises:
+        ValueError: If the row, file, or packet scope is missing or inconsistent.
+    """
+    files = group.get("files")
+    match_row = group.get("match_row")
+    if (not isinstance(files, list) or len(files) != 1 or not isinstance(files[0], dict)
+            or not isinstance(match_row, dict) or set(match_row) != set(FILE_MATCH_COLUMNS)
+            or any(not isinstance(match_row[field], str) for field in FILE_MATCH_COLUMNS)):
+        raise ValueError("File assessments require exactly one file and its original match-table row.")
+    file_record = files[0]
+    if (not isinstance(file_record.get("file"), str) or not file_record["file"]
+            or (file_record.get("commit") is not None and not isinstance(file_record["commit"], str))
+            or file_record.get("repository") != group["repository"]):
+        raise ValueError("Invalid file-assessment source record.")
+    expected_id = identify_evidence([
+        group["repository"], group["product"].get("provider"), group["product"].get("short_name"),
+        file_record["file"], file_record.get("commit"),
+    ])
+    expected_values = {
+        "match_id": expected_id, "repository": group["repository"], "provider": group["product"].get("provider"),
+        "short_name": group["product"].get("short_name"), "file": file_record["file"], "commit": file_record.get("commit") or "",
+    }
+    if any(match_row[field] != value for field, value in expected_values.items()):
+        raise ValueError("Saved match-table row differs from its file-assessment identity.")
+    for evidence in group["evidence_blocks"]:
+        if (not isinstance(evidence, dict) or evidence.get("file") != file_record["file"]
+                or evidence.get("commit") != file_record.get("commit")):
+            raise ValueError("File assessment contains evidence from another file or revision.")
+        for location in evidence.get("locations", []):
+            if (not isinstance(location, dict) or location.get("file") != file_record["file"]
+                    or location.get("commit") != file_record.get("commit")):
+                raise ValueError("File assessment contains an occurrence from another file or revision.")
+    for packet in group["packets"]:
+        if (not isinstance(packet, dict) or packet.get("assessment_unit") != "file"
+                or packet.get("assessment_file") != file_record["file"]
+                or packet.get("assessment_commit") != file_record.get("commit")):
+            raise ValueError("File-classification packet has incompatible assessment scope.")
+    return expected_id
 
 
 def validate_prepared_blocks(group: dict[str, Any]) -> None:
@@ -371,11 +432,12 @@ def collect_observed_versions(classifications: list[dict[str, Any]]) -> list[dic
 
 
 def write_evidence_reports(output_directory: Path, plan: dict[str, Any], settings: dict[str, Any] | None) -> dict[str, Any]:
-    """Refresh concise review.csv, full audit.json, and processing summary.json.
+    """Refresh the matching assessment table, audit, and processing summary.
 
-    Human columns start blank; copy the CSV before adding review notes because
-    subsequent runs regenerate it. Report model processing independently of search
-    completeness. Include usage from all attempts, and count requests without usage.
+    File plans write classified-matches.csv with the original search columns;
+    legacy repository plans keep review.csv. Legacy human columns start blank, so
+    copy that CSV before adding notes. Report processing independently of search
+    completeness. Include usage from all attempts and count missing usage records.
 
     Args:
         output_directory: Command-owned output directory.
@@ -489,9 +551,23 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
             for status in sorted({search["status"] for search in plan.get("source_product_queries", [])})
         },
     }
-    write_protected_csv_rows(output_directory / "review.csv", REVIEW_COLUMNS, rows)
+    is_file_plan = plan.get("assessment_unit") == "file"
+    if is_file_plan:
+        file_rows = [{
+            **group["match_row"], "status": row["status"], "category": row["category"],
+            "explanation": row["explanation"], "gpt_model": row["model"],
+            "evidence_citations": row["evidence_citations"], "error": row["error"],
+        } for group, row in zip(plan["groups"], rows)]
+        summary["assessment_unit"] = "file"
+        summary["file_matches"] = len(file_rows)
+        summary.pop("repository_product_groups")
+        write_protected_csv_rows(output_directory / "classified-matches.csv", FILE_CLASSIFICATION_COLUMNS, file_rows)
+    else:
+        write_protected_csv_rows(output_directory / "review.csv", REVIEW_COLUMNS, rows)
     save_evidence_json(output_directory / "audit.json", {
-        "schema_version": 2, "prompt_version": PROMPT_VERSION, "model": settings["model"] if settings else None,
+        "schema_version": 3 if is_file_plan else 2,
+        "assessment_unit": "file" if is_file_plan else "repository_product",
+        "prompt_version": PROMPT_VERSION, "model": settings["model"] if settings else None,
         "summary_method": "Strongest-supported packet conclusion; all packet judgments and citations retained below.",
         "search_scope": plan["search_scope"], "groups": audit_groups,
     })

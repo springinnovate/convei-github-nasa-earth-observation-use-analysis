@@ -24,7 +24,10 @@ def execute_batch_searches(
 
     Skip verified completed attempts. Retry unfinished queries in newly numbered
     directories, keep historical evidence, and pause one second between requests.
-    Stop on Ctrl+C and save a resumable status. The caller must hold the batch lock.
+    Stop on Ctrl+C and save a resumable status. File-report plans rebuild combined
+    CSVs at the start/end only; each query still saves its own progress immediately.
+    This avoids rescanning all previous matches after every query in a full catalog.
+    The caller must hold the batch lock.
 
     Args:
         output_directory: Batch directory with an immutable, validated plan.json.
@@ -68,7 +71,8 @@ def execute_batch_searches(
             if exit_code == 130:
                 interrupted = True
                 break
-            write_batch_reports(output_directory, plan, "running")
+            if plan.get("report_unit") != "file":
+                write_batch_reports(output_directory, plan, "running")
     except KeyboardInterrupt:
         interrupted = True
     summary = write_batch_reports(output_directory, plan, "interrupted" if interrupted else None)
