@@ -9,6 +9,11 @@ from typing import Any
 
 from nasa_eo_search.catalog_csv import build_product_csv_row, require_catalog_text
 from nasa_eo_search.repo_preview import build_sourcegraph_product_query
+from nasa_eo_search.search_partitions import (
+    PARTITION_SEARCH_STRATEGY,
+    REPOSITORY_PARTITIONS,
+    build_partition_query,
+)
 from nasa_eo_search.sourcegraph import DEFAULT_SOURCEGRAPH_ENDPOINT
 
 
@@ -126,6 +131,9 @@ def validate_saved_batch_plan(plan: Any) -> None:
 
     Rebuild each query and identifier from its saved term and scope. This prevents
     malformed job paths and detects edited queries before any network requests.
+    Legacy plans retain their original queries. Partitioned plans must cover
+    every repository partition exactly once per term with unchanged product
+    associations, so missing or edited partitions cannot narrow a resumed search.
 
     Args:
         plan: Decoded plan.json, independent of the original catalog files.
@@ -135,9 +143,16 @@ def validate_saved_batch_plan(plan: Any) -> None:
     """
 
     if (not isinstance(plan, dict) or type(plan.get("schema_version")) is not int
-            or plan["schema_version"] != 1 or type(plan.get("all_hosts")) is not bool
+            or plan["schema_version"] not in (1, 2) or type(plan.get("all_hosts")) is not bool
             or plan.get("endpoint") != DEFAULT_SOURCEGRAPH_ENDPOINT):
         raise ValueError("Invalid batch plan schema or endpoint.")
+    partitioned_plan = plan["schema_version"] == 2
+    if partitioned_plan and (
+        plan.get("search_strategy") != PARTITION_SEARCH_STRATEGY
+        or type(plan.get("search_timeout_seconds")) is not int
+        or not 1 <= plan["search_timeout_seconds"] <= 60
+    ):
+        raise ValueError("Invalid partition search strategy or timeout.")
     require_catalog_text(plan.get("scope"), "plan.scope")
     catalog_summary = plan.get("catalog_summary")
     if not isinstance(catalog_summary, dict) or catalog_summary.get("status") not in (
@@ -148,13 +163,25 @@ def validate_saved_batch_plan(plan: Any) -> None:
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("Batch plan requires a nonempty jobs list.")
     seen_ids = set()
+    partitions_by_term: dict[str, set[str]] = {}
+    associations_by_term: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
     for job in jobs:
         if not isinstance(job, dict):
             raise ValueError("Each search job must be an object.")
         term = require_catalog_text(job.get("term"), "job.term")
         if term != term.strip() or any(ord(character) < 32 for character in term):
             raise ValueError("Invalid search term in saved plan.")
-        query = build_sourcegraph_product_query(term, plan["all_hosts"], collect_all=True)
+        if partitioned_plan:
+            partition_id = job.get("partition_id")
+            query = build_partition_query(
+                term, plan["all_hosts"], partition_id, plan["search_timeout_seconds"],
+            )
+            term_partitions = partitions_by_term.setdefault(term, set())
+            if partition_id in term_partitions:
+                raise ValueError("A term contains a duplicate repository partition.")
+            term_partitions.add(partition_id)
+        else:
+            query = build_sourcegraph_product_query(term, plan["all_hosts"], collect_all=True)
         search_id = identify_search_query(query)
         if job.get("query") != query or job.get("search_id") != search_id or search_id in seen_ids:
             raise ValueError("Saved query or identifier differs from its term/scope, or is duplicated.")
@@ -163,6 +190,7 @@ def validate_saved_batch_plan(plan: Any) -> None:
         if not isinstance(products, list) or not products:
             raise ValueError("Each job needs product associations.")
         seen_products = set()
+        job_associations = {}
         for product in products:
             if not isinstance(product, dict):
                 raise ValueError("Each product association must be an object.")
@@ -171,6 +199,7 @@ def validate_saved_batch_plan(plan: Any) -> None:
             if key in seen_products or not isinstance(candidate, dict) or candidate.get("term") != term:
                 raise ValueError("Invalid or duplicate product association.")
             seen_products.add(key)
+            job_associations[key] = product
             require_catalog_text(candidate.get("review_status"), "candidate.review_status")
             sources = candidate.get("sources")
             if not isinstance(sources, list) or not sources:
@@ -180,3 +209,11 @@ def validate_saved_batch_plan(plan: Any) -> None:
                     raise ValueError("Candidate source must be an object.")
                 for field in ("concept_id", "source_field"):
                     require_catalog_text(source.get(field), f"candidate source {field}")
+        if partitioned_plan:
+            expected_associations = associations_by_term.setdefault(term, job_associations)
+            if job_associations != expected_associations:
+                raise ValueError("Product associations differ between partitions of the same term.")
+    if partitioned_plan:
+        expected_partitions = {partition["id"] for partition in REPOSITORY_PARTITIONS}
+        if any(partitions != expected_partitions for partitions in partitions_by_term.values()):
+            raise ValueError("Each search term must include every repository partition exactly once.")

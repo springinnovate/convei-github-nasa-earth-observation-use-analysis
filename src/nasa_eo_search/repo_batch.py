@@ -43,6 +43,11 @@ def execute_batch_searches(
         ValueError: If existing attempt directories have invalid paths.
     """
 
+    if plan["schema_version"] == 2:
+        # Legacy resume must preserve saved partition queries, not rebuild global ones.
+        from nasa_eo_search.partition_search import execute_partitioned_searches
+
+        return execute_partitioned_searches(output_directory, plan, ca_bundle_path)
     requests_started = 0
     interrupted = False
     write_batch_reports(output_directory, plan, "running")

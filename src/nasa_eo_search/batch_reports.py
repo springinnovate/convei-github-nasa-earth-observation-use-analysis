@@ -72,7 +72,11 @@ def write_batch_reports(
     status_counts = dict.fromkeys((COMPLETED_SEARCH, "incomplete", "failed", "interrupted", "pending"), 0)
     for job in plan["jobs"]:
         attempts = list_search_attempts(output_directory, job["search_id"])
-        inspected_attempts = [(attempt, *inspect_search_attempt(attempt, job["query"])) for attempt in attempts]
+        inspected_attempts = [(attempt, *inspect_search_attempt(
+            attempt, job["query"],
+            partition_id=job.get("partition_id") if plan["schema_version"] == 2 else None,
+            all_hosts=plan["all_hosts"],
+        )) for attempt in attempts]
         latest_summary = inspected_attempts[-1][1] if attempts else {"status": "pending"}
         latest_matches = inspected_attempts[-1][2] if attempts else []
         status_counts[latest_summary["status"]] += 1
@@ -83,6 +87,9 @@ def write_batch_reports(
             }
             status_rows.append({
                 **association, "status": latest_summary["status"], "attempt_count": len(attempts),
+                "repository_partition": job.get("partition_id", ""),
+                "scope_note": ("No indexed repositories matched this partition."
+                               if latest_summary.get("completion_basis") == "empty_indexed_repository_scope" else ""),
                 "latest_attempt": attempts[-1].name if attempts else "", "match_records": len(latest_matches),
                 "warnings": json.dumps(latest_summary.get("warnings", []), ensure_ascii=False),
                 "error": latest_summary.get("error", ""),
@@ -117,7 +124,8 @@ def write_batch_reports(
         "distinct_queries": len(plan["jobs"]), "searches_by_status": status_counts,
         "product_query_rows": len(status_rows), "match_rows_all_attempts": len(match_rows),
     }
-    write_protected_csv_rows(output_directory / "searches.csv", STATUS_COLUMNS, status_rows)
+    status_columns = (*STATUS_COLUMNS, "repository_partition", "scope_note") if plan["schema_version"] == 2 else STATUS_COLUMNS
+    write_protected_csv_rows(output_directory / "searches.csv", status_columns, status_rows)
     if plan.get("report_unit") == "file":
         file_rows = collapse_batch_file_rows(match_rows, status_rows, plan["catalog_summary"]["status"] == "complete")
         summary["file_match_rows"] = len(file_rows)
