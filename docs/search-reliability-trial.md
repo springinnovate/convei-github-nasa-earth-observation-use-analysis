@@ -4,7 +4,7 @@
 
 Keep issue #22's pull request in draft. The request cap, saved progress,
 bounded retries, and automatic failure stop work, but nine fixed repository
-groups do **not** yet provide reliable discovery of indexed NASA references.
+groups do **not** yet provide reliable discovery of public NASA references.
 Do not restart the full catalog on the strength of these results.
 
 The original `nasa-full-search` directory was left unchanged. This trial used
@@ -30,12 +30,13 @@ ATL03's 80 rows include potentially unrelated identifiers, such as Nautobot's
 site abbreviation; they are not 80 confirmed examples of NASA data use.
 
 The initial combined run selected all three datasets but stopped while searching
-ARIA. Separate runs reached ATL03 and ASF_ECMWF_SMST. Commands:
+ARIA. Separate runs reached ATL03 and ASF_ECMWF_SMST. Commands below include
+`--backend sourcegraph` to select the same service in the current CLI:
 
 ```console
-python -m nasa_eo_search.pipeline search nasa-catalog --short-name ATL03 --short-name ARIA_S1_GUNW --short-name ASF_ECMWF_SMST --output search-results/issue22-live-pilot --max-requests 5
-python -m nasa_eo_search.pipeline search nasa-catalog --short-name ATL03 --output search-results/issue22-atl03-pilot --max-requests 27
-python -m nasa_eo_search.pipeline search nasa-catalog --short-name ASF_ECMWF_SMST --output search-results/issue22-rare-pilot --max-requests 27
+python -m nasa_eo_search.pipeline search nasa-catalog --backend sourcegraph --short-name ATL03 --short-name ARIA_S1_GUNW --short-name ASF_ECMWF_SMST --output search-results/issue22-live-pilot --max-requests 5
+python -m nasa_eo_search.pipeline search nasa-catalog --backend sourcegraph --short-name ATL03 --output search-results/issue22-atl03-pilot --max-requests 27
+python -m nasa_eo_search.pipeline search nasa-catalog --backend sourcegraph --short-name ASF_ECMWF_SMST --output search-results/issue22-rare-pilot --max-requests 27
 ```
 
 Repeating the first command with `--max-requests 1` made exactly one additional
@@ -66,6 +67,12 @@ broader digits/A–C group. That broader group's retry returned zero files with
 no reported limits. Removing the identifier-boundary wrapper did not fix the
 global miss. These observations demonstrate a discovery gap; they do not
 establish its underlying service cause or validate two-letter groups generally.
+
+Repository-scoped successes do not prove that those repositories were included
+in global search. [Sourcegraph documents different default treatment of
+unindexed repositories](https://sourcegraph.com/docs/dotcom) in global and scoped
+queries. The measured problem is scope-dependent discovery, not proof that the
+same indexed corpus was searched incorrectly.
 
 The rare identifier has no known positive control here. Zero returned files
 therefore cannot establish that it is unused.

@@ -60,6 +60,10 @@ def reassemble_evidence_lines(
     original_lines_by_location: dict[tuple[str, str, int], list[str]] = defaultdict(list)
     for file_record in matching_files or []:
         for matching_line in file_record.get("matching_lines", []):
+            if matching_line.get("excerpt") or "character_offset" in matching_line:
+                # Snapshot windows retain actual offsets but are not complete
+                # alternative source lines, even when an excerpt starts at zero.
+                continue
             original_lines_by_location[(file_record["file"], file_record.get("commit") or "",
                                         matching_line["line_number"])].append(matching_line["text"])
     fragments_by_line = defaultdict(list)
