@@ -16,6 +16,7 @@ from nasa_eo_search.evidence_model import CLASSIFICATION_PROMPT, PROMPT_VERSION,
 from nasa_eo_search.evidence_reports import load_evidence_plan, save_evidence_json, write_evidence_reports
 from nasa_eo_search.pipeline_tables import build_file_match_row
 from nasa_eo_search.sourcegraph import build_tls_context
+from nasa_eo_search.snapshot_evidence import read_snapshot_evidence_groups
 
 
 def resolve_file_classification_catalog(batch_directory: Path, catalog_directory: Path | None) -> Path:
@@ -63,15 +64,20 @@ def split_repository_groups_into_files(source_plan: dict[str, Any]) -> list[dict
     }
     for repository_group in source_plan["groups"]:
         for file_record in repository_group["files"]:
-            match_row = build_file_match_row(repository_group, file_record)
+            snapshot_backend = source_plan.get("backend") == "github"
+            match_row = (copy.deepcopy(file_record["snapshot_match_row"]) if snapshot_backend
+                         else build_file_match_row(repository_group, file_record))
             file_group = copy.deepcopy({field: value for field, value in repository_group.items() if field != "files"})
             file_group["files"] = [copy.deepcopy(file_record)]
             file_group["group_id"] = match_row["match_id"]
             file_group["match_row"] = match_row
             file_group["warnings"] = [warning for warning in repository_group["warnings"] if warning not in file_provenance_warnings]
-            if not any(source["latest_attempt"] for source in file_record["sources"]):
+            if snapshot_backend:
+                file_group["warnings"].extend(file_record["snapshot_warnings"])
+                file_group["snapshot_evidence"] = copy.deepcopy(file_record["snapshot_evidence"])
+            elif not any(source["latest_attempt"] for source in file_record["sources"]):
                 file_group["warnings"].append("Some evidence appears only in historical search attempts.")
-            if any(source["status"] != COMPLETED_SEARCH for source in file_record["sources"]):
+            if not snapshot_backend and any(source["status"] != COMPLETED_SEARCH for source in file_record["sources"]):
                 file_group["warnings"].append("Some evidence came from partial or damaged search attempts; inspect provenance.")
             file_groups.append(file_group)
     return file_groups
@@ -111,14 +117,17 @@ def build_file_classification_plan(
 ) -> dict[str, Any]:
     """Prepare one independently scoped evidence assessment per saved file match.
 
-    Reuse the existing context collection and bounded packet packaging. The
-    download cache avoids fetching shared README backgrounds repeatedly, but no
-    matching code from another file is supplied as classification evidence.
+    Reuse the existing context collection and bounded packet packaging for
+    Sourcegraph evidence. GitHub snapshots use their already bounded local
+    excerpts without requesting public context. No matching code from another
+    file is supplied as classification evidence.
 
     Args:
         source_plan: Original saved-search groups and catalog metadata.
-        offline: Use saved matching lines without fetching public context.
-        context_lines: Number of surrounding lines to collect for each match.
+        offline: Use saved Sourcegraph lines without fetching public context.
+            Snapshot evidence always uses its frozen local context.
+        context_lines: Sourcegraph surrounding lines per match. Snapshot context
+            is already bounded when its original readable row is created.
         packet_bytes: Maximum serialized bytes of each complete model packet.
         ca_bundle: Optional certificate authority bundle for public downloads.
 
@@ -129,7 +138,8 @@ def build_file_classification_plan(
     Raises:
         SourcegraphError: If verified transport configuration is invalid.
     """
-    if not offline:
+    snapshot_backend = source_plan.get("backend") == "github"
+    if not offline and not snapshot_backend:
         build_tls_context(ca_bundle)
     plan = {
         **copy.deepcopy({field: value for field, value in source_plan.items() if field != "groups"}),
@@ -143,7 +153,13 @@ def build_file_classification_plan(
         file_record = group["files"][0]
         print(f"[{number}/{len(plan['groups'])}] Gather {group['repository']} / {group['product']['short_name']} / "
               f"{file_record['file']} at {file_record['commit'] or 'unknown revision'}.", file=sys.stderr, flush=True)
-        enrich_evidence_group(group, download_cache, offline, context_lines, ca_bundle)
+        if snapshot_backend:
+            group["evidence"] = copy.deepcopy(group["snapshot_evidence"])
+            group["notebook_cells"] = []
+            group["notebook_decoded_lines"] = []
+            group["evidence_gaps"] = list(file_record["snapshot_warnings"])
+        else:
+            enrich_evidence_group(group, download_cache, offline, context_lines, ca_bundle)
         file_scope = {
             "assessment_unit": "file", "assessment_file": file_record["file"],
             "assessment_commit": file_record["commit"],
@@ -179,10 +195,13 @@ def preview_file_classification_plan(plan: dict[str, Any], arguments: argparse.N
         packet, settings["model"], settings["max_output_tokens"],
     )).encode("utf-8")) for packet in selected_packets)
     blocked_files = sum(not group["packets"] for group in plan["groups"])
+    context_note = ("Evidence uses bounded excerpts and nearby code from saved pinned snapshots; no public context is fetched. "
+                    if plan.get("backend") == "github" else
+                    "This estimate uses saved matching lines only; fetched context can change packet counts and size. ")
     print(f"Dry run: {len(plan['groups'])} file matches; {len(packets)} estimated requests; "
           f"at most {len(selected_packets)} new calls; {blocked_files} blocked files. "
           f"Estimated request JSON: {request_bytes} bytes. "
-          "This estimate uses saved matching lines only; fetched context can change packet counts and size. "
+          + context_note +
           "No files written, keys read, public context fetched, or model calls made.", file=sys.stderr)
     return 0
 
@@ -215,8 +234,12 @@ def classify_file_matches(arguments: argparse.Namespace) -> int:
         raise ValueError("--max-requests must be positive when supplied.")
     batch_directory = arguments.batch_directory.resolve()
     output_directory = arguments.output.resolve()
-    catalog_directory = resolve_file_classification_catalog(batch_directory, arguments.catalog)
-    source_plan = read_product_evidence_groups(batch_directory, catalog_directory)
+    source_backend = read_evidence_json(batch_directory / "plan.json").get("backend")
+    if source_backend == "github":
+        source_plan = read_snapshot_evidence_groups(batch_directory, arguments.catalog)
+    else:
+        catalog_directory = resolve_file_classification_catalog(batch_directory, arguments.catalog)
+        source_plan = read_product_evidence_groups(batch_directory, catalog_directory)
     if read_evidence_json(batch_directory / "summary.json") != source_plan["source_batch_summary"]:
         raise ValueError("The saved search changed while reading it; finish or stop the search before classification.")
     if output_directory.exists():

@@ -122,7 +122,7 @@ class SimplePipelineTests(unittest.TestCase):
             datasets = read_pipeline_csv(catalog / "datasets.csv")
             self.assertEqual(len(datasets), 1)
             self.assertEqual(datasets[0]["short_name"], "ATL03")
-            search_arguments = ["search", str(catalog), "--output", str(search)]
+            search_arguments = ["search", str(catalog), "--backend", "sourcegraph", "--output", str(search)]
             with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_pipeline_matches) as requests, patch("nasa_eo_search.repo_batch.time.sleep"), redirect_stderr(StringIO()):
                 self.assertEqual(main(search_arguments), 0)
                 self.assertEqual(requests.call_count, 27)
@@ -162,7 +162,7 @@ class SimplePipelineTests(unittest.TestCase):
             output, preview = root / "datasets.csv", root / "preview"
             with patch("nasa_eo_search.catalog.fetch_cmr_collection_page") as nasa, patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events") as search, redirect_stderr(StringIO()) as terminal:
                 self.assertEqual(main(["catalog", "--from", str(catalog), "--output", str(output)]), 0)
-                self.assertEqual(main(["search", str(catalog), "--output", str(preview), "--dry-run"]), 0)
+                self.assertEqual(main(["search", str(catalog), "--backend", "sourcegraph", "--output", str(preview), "--dry-run"]), 0)
                 self.assertIn("3 distinct terms; 27 search queries", terminal.getvalue())
                 nasa.assert_not_called()
                 search.assert_not_called()
@@ -176,7 +176,7 @@ class SimplePipelineTests(unittest.TestCase):
             root = Path(temporary_directory)
             catalog = save_pipeline_catalog(root, [make_pipeline_product()])
             output = root / "search"
-            arguments = ["search", str(catalog), "--output", str(output)]
+            arguments = ["search", str(catalog), "--backend", "sourcegraph", "--output", str(output)]
             with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_single_pipeline_match) as requests, patch("nasa_eo_search.partition_search.time.sleep", side_effect=[None, KeyboardInterrupt()]), redirect_stderr(StringIO()):
                 self.assertEqual(main(arguments), 130)
                 self.assertEqual(requests.call_count, 2)
@@ -198,7 +198,7 @@ class SimplePipelineTests(unittest.TestCase):
             root = Path(temporary_directory)
             catalog = save_pipeline_catalog(root, [make_pipeline_product(), make_pipeline_product("ATL06")])
             output = root / "search"
-            arguments = ["search", str(catalog), "--output", str(output), "--short-name", "ATL03"]
+            arguments = ["search", str(catalog), "--backend", "sourcegraph", "--output", str(output), "--short-name", "ATL03"]
             with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_pipeline_matches), patch("nasa_eo_search.repo_batch.time.sleep"), redirect_stderr(StringIO()):
                 self.assertEqual(main(arguments), 0)
             saved_files = {path: path.read_bytes() for path in output.rglob("*") if path.is_file()}
@@ -214,7 +214,7 @@ class SimplePipelineTests(unittest.TestCase):
             root = Path(temporary_directory)
             catalog = save_pipeline_catalog(root, [make_pipeline_product()])
             output = root / "search"
-            arguments = ["search", str(catalog), "--output", str(output)]
+            arguments = ["search", str(catalog), "--backend", "sourcegraph", "--output", str(output)]
             with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_single_pipeline_match) as requests, patch("nasa_eo_search.partition_search.time.sleep"), redirect_stderr(StringIO()):
                 self.assertEqual(main([*arguments, "--max-requests", "1"]), 4)
                 self.assertEqual(requests.call_count, 1)
@@ -239,7 +239,7 @@ class SimplePipelineTests(unittest.TestCase):
             catalog = save_pipeline_catalog(root, [make_pipeline_product()])
             output = root / "search"
             with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_single_pipeline_match) as requests, patch("nasa_eo_search.partition_search.time.sleep"), redirect_stderr(StringIO()):
-                self.assertEqual(main(["search", str(catalog), "--output", str(output), "--max-requests", "1"]), 4)
+                self.assertEqual(main(["search", str(catalog), "--backend", "sourcegraph", "--output", str(output), "--max-requests", "1"]), 4)
                 self.assertEqual(run_legacy_batch_command(["resume", str(output)]), 0)
             saved_plan = json.loads((output / "plan.json").read_text(encoding="utf-8"))
             self.assertEqual([request.args[1] for request in requests.call_args_list],
@@ -272,7 +272,7 @@ class SimplePipelineTests(unittest.TestCase):
             root = Path(temporary_directory)
             catalog = save_pipeline_catalog(root, [make_pipeline_product()])
             output = root / "search"
-            arguments = ["search", str(catalog), "--output", str(output)]
+            arguments = ["search", str(catalog), "--backend", "sourcegraph", "--output", str(output)]
             with patch("nasa_eo_search.repo_search.stream_sourcegraph_search_events", side_effect=stream_single_pipeline_match), redirect_stderr(StringIO()):
                 self.assertEqual(main([*arguments, "--max-requests", "1"]), 4)
             saved_files = {path: path.read_bytes() for path in output.rglob("*") if path.is_file()}
