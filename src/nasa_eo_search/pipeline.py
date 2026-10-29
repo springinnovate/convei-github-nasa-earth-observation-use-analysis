@@ -49,7 +49,51 @@ def collect_dataset_table(arguments: argparse.Namespace) -> int:
 
 
 def search_dataset_catalog(arguments: argparse.Namespace) -> int:
-    """Search all selected catalog terms or resume their saved search plan.
+    """Search the catalog with GitHub or Sourcegraph, retaining the saved backend.
+
+    New output directories default to GitHub unless ``--backend`` is supplied.
+    For an existing directory, read ``plan.json`` to choose the same backend
+    and reject incompatible options before handing work to that search command.
+
+    Args:
+        arguments: Catalog/output paths, backend selection, dataset filters,
+            request and download limits, and resume/dry-run options.
+
+    Returns:
+        Backend exit status: zero for success/preview, four for incomplete work,
+        one for failures, or 130 for interruption.
+
+    Raises:
+        OSError: If an existing plan cannot be read.
+        ValueError: If the backend or its options conflict with saved work.
+    """
+    saved_backend = None
+    if arguments.output.exists():
+        saved_plan = read_evidence_json(arguments.output / "plan.json")
+        saved_backend = saved_plan.get("backend", "sourcegraph")
+        if saved_backend not in {"github", "sourcegraph"}:
+            raise ValueError("Unknown saved search backend; existing outputs were not changed.")
+    backend = arguments.backend or saved_backend or "github"
+    if saved_backend is not None and backend != saved_backend:
+        raise ValueError("A saved search cannot change backend; choose a new output directory.")
+    if backend == "github":
+        if arguments.all_hosts or arguments.search_timeout is not None:
+            raise ValueError("--all-hosts and --search-timeout apply only to --backend sourcegraph.")
+        from nasa_eo_search.github_search import search_github_catalog
+        return search_github_catalog(arguments)
+    if any(getattr(arguments, option) is not None for option in (
+        "github_pages", "max_repositories", "max_archive_mb", "max_total_mb", "include_grep_app",
+    )):
+        raise ValueError("GitHub discovery/download options cannot be used with a Sourcegraph search.")
+    return search_sourcegraph_catalog(arguments)
+
+
+def search_sourcegraph_catalog(arguments: argparse.Namespace) -> int:
+    """Run or resume Sourcegraph queries for the selected catalog datasets.
+
+    New runs split queries into repository groups and save progress in the
+    output directory. Existing runs reuse their saved query plan. A dry run
+    prints query counts without making requests or writing files.
 
     Args:
         arguments: Source catalog, output directory, optional exact product filters,
@@ -131,12 +175,18 @@ def main(argument_values: list[str] | None = None) -> int:
     catalog.add_argument("--short-name", help="collect one exact dataset name for a trial")
     search = commands.add_parser("search", help="search catalog terms and save one row per dataset/file")
     search.add_argument("catalog", type=Path, help="directory from the catalog command")
+    search.add_argument("--backend", choices=("github", "sourcegraph"), help="new runs default to GitHub; resume uses the saved backend")
     search.add_argument("--short-name", action="append", help="search only this dataset; repeat for several")
     search.add_argument("--all-hosts", action="store_true", help="include all indexed public code hosts, not just GitHub")
     search.add_argument("--dry-run", action="store_true", help="show the selected query count without searching")
-    search.add_argument("--max-requests", type=int, help="stop after this many new Sourcegraph calls, including retries")
+    search.add_argument("--max-requests", type=int, help="discovery-call cap per invocation (GitHub default: 10; Sourcegraph counts retries)")
+    search.add_argument("--github-pages", type=int, help="maximum pages per GitHub term, 1-10 (new-run default: 10)")
+    search.add_argument("--max-repositories", type=int, help="maximum pinned snapshots (new GitHub run default: 6)")
+    search.add_argument("--max-archive-mb", type=int, help="compressed download cap per snapshot (default: 100 decimal MB)")
+    search.add_argument("--max-total-mb", type=int, help="total retained snapshot download budget (default: 300 decimal MB)")
+    search.add_argument("--include-grep-app", action="store_true", default=None, help="supplement GitHub with bounded grep.app discovery")
     search.add_argument("--search-timeout", type=int, help="seconds per partition: 1-60, default 10 for new runs; retained on resume")
-    search.add_argument("--retry-incomplete", action="store_true", help="explicitly allow two more attempts per unfinished partition")
+    search.add_argument("--retry-incomplete", action="store_true", help="explicitly retry saved failures/unfinished work; backend-specific limits remain")
     classify = commands.add_parser("classify", help="classify saved matching files; automatically gather context and resume")
     classify.add_argument("batch_directory", type=Path, help="saved search output directory")
     classify.add_argument("--catalog", type=Path, help="source catalog if it has moved; otherwise use its saved location")

@@ -23,7 +23,12 @@ MATCH_COLUMNS = (*ASSOCIATION_COLUMNS, "attempt", "attempt_status", "latest_atte
 
 
 def write_protected_csv_rows(output_path: Path, columns: tuple[str, ...], rows: Iterable[dict[str, Any]]) -> None:
-    """Atomically publish a spreadsheet report with quoted, protected text cells.
+    """Write a CSV report that treats formula-like source values as text.
+
+    Quote each cell and prefix formula-like values with ``Text: `` so a
+    spreadsheet does not calculate a formula found in repository text. This
+    changes the CSV display only, not the saved JSON or source code. Write to
+    a temporary file first, then replace the previous report when complete.
 
     Args:
         output_path: Batch-owned report file to replace.
