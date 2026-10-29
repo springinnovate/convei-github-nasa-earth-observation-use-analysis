@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from nasa_eo_search.evidence_inputs import read_evidence_json
+from nasa_eo_search.notebook_context import add_notebook_classification_context
 from nasa_eo_search.snapshot_evidence import (
     MAX_EVIDENCE_CHARACTERS, MATCHING_WINDOW_CHARACTERS,
     build_snapshot_excerpt_citation, read_matched_files_from_snapshot_zip,
@@ -63,6 +64,7 @@ def add_enclosing_classification_context(group: dict[str, Any], source_lines: li
     evidence is never discarded, including larger legacy Sourcegraph excerpts.
     Every new excerpt keeps its original file, commit, line, and character offset.
     Report parsing fallbacks and omitted text in the assessment's evidence gaps.
+    Notebook sections use decoded source cells; stored outputs are not added.
 
     Args:
         group: One file/product assessment with raw evidence and evidence_gaps;
@@ -79,6 +81,10 @@ def add_enclosing_classification_context(group: dict[str, Any], source_lines: li
                 and source_lines[number - 1][offset:offset + len(text)] == text):
             group["evidence_gaps"].append("Enclosing code omitted: saved matches differ from the pinned source text.")
             return
+    if file_record["file"].lower().endswith(".ipynb"):
+        add_notebook_classification_context(group, source_lines, MAX_ADDITIONAL_CONTEXT_CHARACTERS,
+                                            MAX_EVIDENCE_CHARACTERS, MATCHING_WINDOW_CHARACTERS)
+        return
     selection = select_enclosing_source_lines(
         file_record["file"], source_lines,
         [line["line_number"] for line in file_record["matching_lines"]])

@@ -94,7 +94,43 @@ class PythonSourceContextTests(unittest.TestCase):
         source_lines = ["raise RuntimeError('source was executed')", "dataset = 'ATL03'"]
         selection = select_enclosing_source_lines("untrusted.py", source_lines, [2])
         self.assertIn(2, selection["line_numbers"])
-        self.assertEqual(selection["notes"], [])
+        self.assertTrue(any("does not establish a connection" in note for note in selection["notes"]))
+
+    def test_short_top_level_script_keeps_distant_consuming_statements(self) -> None:
+        """Retain later parsing, retrieval and output without executing a short script."""
+        source_lines = [
+            "# Reusable download command.",
+            "raise RuntimeError('must not execute')",
+            "options.add_argument('--dataset', default='EXAMPLE_PRODUCT')",
+            *["# other setup"] * 35,
+            "settings = options.parse_args()",
+            *["# validate user settings"] * 35,
+            "response = download(settings.dataset)",
+            "save_response(response, settings.output)",
+        ]
+        selection = select_enclosing_source_lines("download.py", source_lines, [3])
+        self.assertEqual(set(selection["line_numbers"]), set(range(1, len(source_lines) + 1)))
+        self.assertIn(source_lines.index("settings = options.parse_args()") + 1, selection["line_numbers"])
+        self.assertIn(len(source_lines), selection["line_numbers"])
+
+    def test_malformed_top_level_script_retains_code_and_syntax_limitation(self) -> None:
+        """Show distant operations in a small broken script without guessing execution."""
+        source_lines = [
+            "# Download a user-selected dataset.",
+            "arguments.add_argument('--product', default='EXAMPLE_PRODUCT')",
+            "arguments.add_argument('--region', help='region'",
+            *["# intervening argument setup"] * 35,
+            "selection = arguments.parse_args()",
+            *["# intervening validation"] * 35,
+            "result = fetch(selection.product)",
+            "write_result(result)",
+        ]
+        selection = select_enclosing_source_lines("broken_download.py", source_lines, [2])
+        self.assertIn(len(source_lines) - 1, selection["line_numbers"])
+        self.assertIn(len(source_lines), selection["line_numbers"])
+        self.assertIn("SyntaxError", selection["notes"][0])
+        self.assertIn("syntax and data flow are unverified", selection["notes"][0])
+        self.assertTrue(any("may include unrelated operations" in note for note in selection["notes"]))
 
     def test_static_method_parameter_is_not_treated_as_class_instance(self) -> None:
         """Exclude another object's same-named attribute inside static methods."""
@@ -255,6 +291,35 @@ class SourceContextFallbackTests(unittest.TestCase):
         selection = select_enclosing_source_lines("analysis.ipynb", ['{"cells": ["ATL03"]}'], [1])
         self.assertEqual(selection["line_numbers"], [1])
         self.assertIn("unsupported for .ipynb", selection["notes"][0])
+
+    def test_small_javascript_example_keeps_purpose_and_later_visualization(self) -> None:
+        """Include a short demonstration's purpose comment and its final operation."""
+        source_lines = ["// Simple image collection demonstration.", *["// setup"] * 11]
+        source_lines.extend([
+            "const images = dataset('EXAMPLE_PRODUCT');",
+            *["// adjust preview"] * 25,
+            "const preview = animatedThumbnail(images);",
+            "display(preview);",
+        ])
+        selection = select_enclosing_source_lines("example.js", source_lines, [13])
+        self.assertEqual(set(selection["line_numbers"]), set(range(1, len(source_lines) + 1)))
+        self.assertLess(selection["line_numbers"].index(1), 12)
+        self.assertIn("complete small-script text", selection["notes"][0])
+
+    def test_large_script_keeps_header_but_does_not_expand_to_unrelated_distant_code(self) -> None:
+        """Bound script-wide selection by both line count and character count."""
+        for source_lines in (
+            ["// Worked demonstration.", *["// comment"] * 200],
+            ["// Worked demonstration.", *["// " + "x" * 100] * 100],
+        ):
+            with self.subTest(line_count=len(source_lines)):
+                source_lines[49] = "const images = dataset('EXAMPLE_PRODUCT');"
+                source_lines[-1] = "unrelated_operation();"
+                selection = select_enclosing_source_lines("large.js", source_lines, [50])
+                self.assertIn(1, selection["line_numbers"])
+                self.assertNotIn(len(source_lines), selection["line_numbers"])
+                self.assertLessEqual(len(selection["line_numbers"]), MAX_SELECTED_LINES)
+                self.assertIn("bounded file header", selection["notes"][0])
 
     def test_malformed_configuration_returns_explicit_fallback(self) -> None:
         """Reject mismatched flow-container brackets without guessing a block."""

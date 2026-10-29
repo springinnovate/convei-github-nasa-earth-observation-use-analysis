@@ -50,6 +50,7 @@ def locate_json_object_fields(text: str, start: int) -> dict[str, tuple[Any, int
 
 def decode_notebook_source_cells(
     contents: str, file_record: dict[str, Any], evidence: list[dict[str, Any]],
+    *, include_context: bool = False,
 ) -> tuple[list[dict[str, Any]], set[int], list[str]]:
     """Extract matched notebook cells, retaining raw line spans for every citation.
 
@@ -60,6 +61,9 @@ def decode_notebook_source_cells(
         contents: Complete downloaded notebook JSON.
         file_record: Immutable repository, file, and commit identity.
         evidence: Saved raw matching and surrounding line fragments.
+        include_context: Also decode unmatched source cells for bounded context
+            selection. Their kind remains enclosing_code, and raw offsets are
+            supplied so callers can retain exact source citations.
 
     Returns:
         Decoded cell blocks, raw line numbers represented by complete source
@@ -99,7 +103,8 @@ def decode_notebook_source_cells(
             }
             # One minified raw line can contain source, outputs, and metadata.
             # Line-only search evidence cannot establish which field matched.
-            if not complete_source_lines.intersection(matching_numbers):
+            contains_match = bool(complete_source_lines.intersection(matching_numbers))
+            if not contains_match and not include_context:
                 continue
             if isinstance(source, str):
                 cell_text = source
@@ -129,14 +134,16 @@ def decode_notebook_source_cells(
                     "text_start": text_offset, "text_end": text_offset + len(part),
                     "source_ids": [item["evidence_id"] for item in evidence
                                    if part_start_line <= item["line_number"] <= part_end_line],
+                    **({"raw_start": part_start, "raw_end": part_end} if include_context else {}),
                 })
                 text_offset += len(part)
             blocks.append({
                 **{name: file_record[name] for name in ("repository", "file", "commit")},
                 "line_number": start_line, "end_line": end_line, "text": cell_text,
-                "kind": "matching_line", "cell_index": cell_index,
+                "kind": "matching_line" if contains_match else "enclosing_code", "cell_index": cell_index,
                 "cell_type": cell.get("cell_type", "unknown"), "source_ids": source_ids,
                 "representation": "notebook_source_cell", "source_line_map": source_line_map,
+                **({"complete_source_lines": sorted(complete_source_lines)} if include_context else {}),
             })
             # Only omit raw lines wholly inside this source field. A compact
             # one-line notebook can also contain output matches on the same line.

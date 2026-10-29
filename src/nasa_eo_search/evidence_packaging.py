@@ -497,7 +497,8 @@ def slice_evidence_block(
         if name in locations[0]:
             fragment[name] = locations[0][name]
     fragment["kind"] = ("matching_line" if matching_source_ids.intersection(fragment["source_ids"])
-                        else "enclosing_code" if block["kind"] == "enclosing_code" else "surrounding_code")
+                        else "enclosing_code" if block["kind"] == "enclosing_code"
+                        or block.get("context_kind") == "enclosing_code" else "surrounding_code")
     return fragment
 
 

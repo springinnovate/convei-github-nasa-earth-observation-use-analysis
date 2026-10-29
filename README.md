@@ -297,19 +297,34 @@ It can also include up to ten lines before and after each selected matching
 line, with a combined limit of 12,000 text characters. Classification retains
 these original excerpts and can add enclosing Python functions/classes or
 configuration blocks, including nearby uses of an identifier table or YAML
-anchor. Added code stays in the same file and revision, has source citations,
-and uses at most 6,000 additional characters within the combined 12,000-character
-limit. Unsupported or malformed files retain nearby context. Warnings identify
-omitted text; the full scan results and ZIP remain available. These limits are fixed;
+anchor. Small scripts can include their complete source (up to 160 lines and
+6,000 characters); Python files containing functions or classes keep selective
+context. Leading comments help explain the file's purpose.
+
+For notebooks, classification reads source cells in the matching section and
+includes introductory text when it fits. Added notebook context excludes stored
+outputs and metadata, retains cell locations, and stops at section boundaries.
+Original matching excerpts remain available even when a notebook cannot be decoded.
+
+Added code stays in the same file and revision, has source citations, and uses
+at most 6,000 additional characters within the combined 12,000-character limit.
+Other files fall back to bounded nearby context. Warnings identify omitted text;
+the full scan results and ZIP remain available. These limits are fixed;
 `--context-lines` controls fetched Sourcegraph context only.
 
 | Category | What the supplied evidence establishes |
 | --- | --- |
-| `direct_use` | An analysis or end-user application consumes the dataset for its own result. |
-| `supporting_software` | A reusable library, service, adapter, processing tool, test, or worked example enables dataset access or processing. It may itself read or download data. |
+| `direct_use` | An analysis or end-user application consumes the dataset to answer its own question or produce an application result. |
+| `supporting_software` | A reusable library, service, adapter, processing tool, test, tutorial, or worked demonstration enables dataset access or processing. It may itself read data, calculate values, or display a plot. |
 | `reference_only` | Relevant prose mentions the dataset without demonstrating code use. |
 | `unrelated` | The identifier clearly means something else. |
 | `unclear` | Evidence is insufficient, conflicting, or unfinished. |
+
+A worked example that loads a dataset and plots it to demonstrate a tool counts
+as supporting software. An analysis that uses the dataset to answer its own
+question counts as direct use. The classifier considers explanatory comments,
+notebook text, and the code together. A file's name, location, or notebook format
+alone does not establish its purpose; ambiguous cases remain `unclear`.
 
 The classifier also receives catalog mappings for identifiers actually present
 in its evidence, including collection IDs, catalog versions, and NASA metadata
@@ -332,7 +347,9 @@ Repeat the same classification command to resume. Frozen evidence and successful
 responses are reused. Keep the source search/catalog, model, and output-token
 settings unchanged. A changed search requires a new classification directory.
 Existing runs retain their saved prompt and inputs. Use a new `--output`
-directory to apply updated context packaging and category guidance.
+directory to gather context again and apply the current category guidance,
+even when the source search has not changed. The existing output keeps its
+original assessments; the new run can make paid model requests.
 
 For GitHub runs, a new classification directory also applies catalog identity
 filtering to the saved snapshots. Older classification directories keep their

@@ -64,7 +64,7 @@ def load_evidence_plan(output_directory: Path) -> dict[str, Any]:
     if (type(schema_version) is not int or schema_version not in (2, 3)
             or (isinstance(plan, dict) and (not isinstance(plan.get("prompt_version"), str)
                 or plan["prompt_version"] not in CLASSIFICATION_PROMPTS))):
-        raise ValueError("This run needs evidence format 2 or file format 3 and repository-product-v2 or repository-product-v3. Existing results are unchanged; "
+        raise ValueError("This run needs evidence format 2 or file format 3 and a supported classification prompt (repository-product-v2, v3, or v4). Existing results are unchanged; "
                          "use nasa-evidence-classify repack SOURCE --output NEW, or prepare a new directory.")
     if (not isinstance(plan, dict) or envelope.get("plan_id") != identify_evidence(plan)
             or not isinstance(plan.get("groups"), list)):
