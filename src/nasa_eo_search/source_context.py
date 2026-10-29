@@ -12,6 +12,10 @@ MAX_SELECTED_LINES = 400
 MAX_STRUCTURAL_MATCHES = 64
 MAX_CONSUMERS = 3
 NEARBY_LINE_COUNT = 10
+MAX_COMPLETE_SCRIPT_LINES = 160
+MAX_COMPLETE_SCRIPT_CHARACTERS = 6000
+MAX_FILE_HEADER_CHARACTERS = 600
+SCRIPT_EXTENSIONS = {".py", ".pyi", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".sh", ".r"}
 PYTHON_DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 
@@ -27,6 +31,10 @@ def select_enclosing_source_lines(
     text structure. Returned line numbers retain the original file coordinates
     and are ordered by evidence priority, not file order, so callers can apply
     their own character budget without losing distant definition headers.
+    Small scripts can include their complete source within the added-context
+    character budget. Python containing definitions retains selective structural
+    context. Unsupported, malformed, or oversized source receives an explicit
+    fallback, with a bounded file-purpose header when available.
 
     Args:
         file_path: Repository-relative path used to identify the source format.
@@ -36,7 +44,6 @@ def select_enclosing_source_lines(
     Returns:
         A dictionary containing ``line_numbers`` (at most 400 unique, valid
         original line numbers) and ``notes`` explaining fallback or truncation.
-        Unsupported, malformed, or oversized source receives nearby context.
     """
     matches = sorted({
         line_number for line_number in matching_line_numbers
@@ -53,7 +60,9 @@ def select_enclosing_source_lines(
         return _select_nearby_fallback(source_lines, matches, "Source exceeds the structural parsing byte limit.")
     extension = PurePosixPath(file_path.replace("\\", "/")).suffix.lower()
     if extension not in {".py", ".pyi", ".yaml", ".yml", ".json"}:
-        return _select_nearby_fallback(source_lines, matches, f"Structural context is unsupported for {extension or 'this file type'}.")
+        fallback = _select_nearby_fallback(source_lines, matches, f"Structural context is unsupported for {extension or 'this file type'}.")
+        _add_script_file_context(source_lines, extension, fallback)
+        return fallback
     if len(matches) > MAX_STRUCTURAL_MATCHES:
         result["notes"].append(f"Structural selection examines the first {MAX_STRUCTURAL_MATCHES} matching lines in this file.")
         matches = matches[:MAX_STRUCTURAL_MATCHES]
@@ -67,8 +76,74 @@ def select_enclosing_source_lines(
     except (SyntaxError, ValueError, RecursionError) as error:
         fallback = _select_nearby_fallback(source_lines, matches, f"Structural parsing failed ({type(error).__name__}).")
         fallback["notes"].extend(result["notes"])
+        _add_script_file_context(source_lines, extension, fallback)
         return fallback
+    _add_script_file_context(source_lines, extension, result)
     return result
+
+
+def _add_script_file_context(source_lines: list[str], extension: str, result: dict) -> None:
+    """Add bounded file-purpose comments and complete small script context.
+
+    Complete text helps connect top-level defaults to later parsing, retrieval,
+    and output operations, including scripts with syntax errors. This selects
+    evidence for inspection without claiming to resolve a program's data flow.
+    Python definitions keep the existing selective context so unrelated methods
+    and shadowed names are not pulled into an otherwise focused assessment.
+
+    Args:
+        source_lines: Original source lines, never executed.
+        extension: Lowercase file suffix identifying a script format.
+        result: Mutable line selection and limitations from structural selection
+            or nearby fallback. Existing coordinates retain their priority.
+    """
+    if extension not in SCRIPT_EXTENSIONS:
+        return
+    contains_python_definitions = extension in {".py", ".pyi"} and any(
+        re.match(r"^[ \t]*(?:async[ \t]+def|def|class)\b", source_line)
+        for source_line in source_lines
+    )
+    if contains_python_definitions and any("Structural parsing failed" in note for note in result["notes"]):
+        return
+    header_numbers = []
+    header_characters = 0
+    for number, source_line in enumerate(source_lines[:8], 1):
+        stripped_line = source_line.strip()
+        if stripped_line and not stripped_line.startswith(("#", "//", "/*", "*", "*/")):
+            break
+        if header_characters + len(source_line) > MAX_FILE_HEADER_CHARACTERS:
+            break
+        if stripped_line:
+            header_numbers.append(number)
+            header_characters += len(source_line)
+    if header_numbers:
+        # Keep established definition/consumer priority, then show purpose before
+        # long bodies can consume the caller's remaining character budget.
+        original_numbers = result["line_numbers"]
+        result["line_numbers"] = []
+        _append_source_lines(result, original_numbers[:8], len(source_lines))
+        _append_source_lines(result, header_numbers, len(source_lines))
+        _append_source_lines(result, original_numbers[8:], len(source_lines))
+    complete_script = (
+        not contains_python_definitions
+        and len(source_lines) <= MAX_COMPLETE_SCRIPT_LINES
+        and sum(map(len, source_lines)) <= MAX_COMPLETE_SCRIPT_CHARACTERS
+    )
+    if complete_script:
+        _append_source_lines(result, range(1, len(source_lines) + 1), len(source_lines))
+        result["notes"].append(
+            "Complete small-script context may include unrelated operations; "
+            "inclusion alone does not establish a connection to the matched product.")
+        result["notes"] = [
+            note.replace("Using nearby lines only.",
+                         "Including complete small-script text; syntax and data flow are unverified.")
+            for note in result["notes"]
+        ]
+    elif header_numbers:
+        result["notes"] = [
+            note.replace("Using nearby lines only.", "Using nearby lines and a bounded file header.")
+            for note in result["notes"]
+        ]
 
 
 def _append_source_lines(result: dict, line_numbers: range | list[int], source_length: int) -> None:

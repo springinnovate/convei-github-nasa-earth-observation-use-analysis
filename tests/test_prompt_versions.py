@@ -22,17 +22,20 @@ from test_evidence_classify import create_saved_evidence_inputs, make_model_resp
 from test_evidence_reports_v2 import create_report_plan
 
 
-def save_legacy_classification_run(output_directory: Path) -> dict:
-    """Create a complete v2 run with raw paid-response receipts for resume tests.
+def save_legacy_classification_run(
+    output_directory: Path, prompt_version: str = "repository-product-v2",
+) -> dict:
+    """Create a historical run with raw paid-response receipts for resume tests.
 
     Args:
         output_directory: New destination inside the test's temporary directory.
+        prompt_version: Supported historical instructions to freeze in the plan.
 
     Returns:
         Frozen historical plan whose responses cite its original source blocks.
     """
     plan = create_report_plan(packet_count=1)
-    plan["prompt_version"] = "repository-product-v2"
+    plan["prompt_version"] = prompt_version
     with redirect_stderr(StringIO()):
         save_prepared_classification_plan(output_directory, plan)
     settings = {"model": "test-model", "max_output_tokens": 2048, "prompt_version": plan["prompt_version"]}
@@ -65,11 +68,33 @@ class ClassificationPromptVersionTests(unittest.TestCase):
         self.assertEqual(identify_evidence(request_body),
                          "bac42f3d613e52185566a717801ee4a8df452d1379f69c3921870f61b03257f7")
 
-    def test_cached_v2_resume_preserves_reports_without_keys_or_calls(self) -> None:
-        """Resume historical conclusions without relabeling them or requesting a key."""
-        with TemporaryDirectory() as temporary_directory:
+    def test_v3_request_retains_exact_pre_upgrade_hash(self) -> None:
+        """Keep the original v3 prompt and request identity for cached assessments."""
+        instructions = select_classification_prompt("repository-product-v3")
+        self.assertEqual(hashlib.sha256(instructions.encode("utf-8")).hexdigest(),
+                         "abff2a1c646d0659d7c45262012e2891fb9c93e7f29aff73fc0958557163b245")
+        request_body = build_classification_request(
+            {"evidence": [], "product": {"short_name": "ATL03"}}, "test-model", 2048, "repository-product-v3",
+        )
+        self.assertEqual(identify_evidence(request_body),
+                         "ee97840f3c5d191f7378ffb853b3b84aa43bbc15c6d3658e3c1702593e1b5d1f")
+
+    def test_cached_legacy_resume_preserves_reports_without_keys_or_calls(self) -> None:
+        """Resume v2 and v3 conclusions without relabeling them or requesting a key."""
+        for prompt_version in ("repository-product-v2", "repository-product-v3"):
+            with self.subTest(prompt_version=prompt_version), TemporaryDirectory() as temporary_directory:
+                self.assert_legacy_resume_preserves_saved_outputs(Path(temporary_directory), prompt_version)
+
+    def assert_legacy_resume_preserves_saved_outputs(self, temporary_directory: Path, prompt_version: str) -> None:
+        """Check a complete historical run keeps every durable result and request.
+
+        Args:
+            temporary_directory: Test-owned directory for the saved run.
+            prompt_version: Historical instructions used by its cached responses.
+        """
+        with redirect_stderr(StringIO()):
             output_directory = Path(temporary_directory) / "legacy"
-            save_legacy_classification_run(output_directory)
+            save_legacy_classification_run(output_directory, prompt_version)
             original_files = {
                 str(path.relative_to(output_directory)): path.read_bytes()
                 for path in output_directory.rglob("*") if path.is_file() and path.name != "summary.json"
@@ -89,19 +114,21 @@ class ClassificationPromptVersionTests(unittest.TestCase):
             })
             with (output_directory / "review.csv").open(encoding="utf-8-sig", newline="") as report:
                 row = next(csv.DictReader(report))
-            self.assertEqual(row["prompt_version"], "repository-product-v2")
+            self.assertEqual(row["prompt_version"], prompt_version)
             self.assertEqual(row["category"], "supporting_software")
-            self.assertEqual(read_evidence_json(output_directory / "audit.json")["prompt_version"], "repository-product-v2")
+            self.assertEqual(read_evidence_json(output_directory / "audit.json")["prompt_version"], prompt_version)
 
-    def test_new_requests_cannot_reuse_v2_response_identity(self) -> None:
+    def test_new_requests_cannot_reuse_legacy_response_identity(self) -> None:
         """Change the request identity even when source evidence and model are identical."""
         packet = create_report_plan(packet_count=1)["groups"][0]["packets"][0]
         current_request = build_classification_request(packet, "test-model", 2048)
-        legacy_request = build_classification_request(packet, "test-model", 2048, "repository-product-v2")
-        self.assertEqual(PROMPT_VERSION, "repository-product-v3")
+        self.assertEqual(PROMPT_VERSION, "repository-product-v4")
         self.assertEqual(current_request["instructions"], CLASSIFICATION_PROMPT)
-        self.assertEqual(current_request["input"], legacy_request["input"])
-        self.assertNotEqual(identify_evidence(current_request), identify_evidence(legacy_request))
+        for prompt_version in ("repository-product-v2", "repository-product-v3"):
+            with self.subTest(prompt_version=prompt_version):
+                legacy_request = build_classification_request(packet, "test-model", 2048, prompt_version)
+                self.assertEqual(current_request["input"], legacy_request["input"])
+                self.assertNotEqual(identify_evidence(current_request), identify_evidence(legacy_request))
 
     def test_repack_upgrades_legacy_prompt_without_touching_paid_receipts(self) -> None:
         """Write a new current-version plan while every historical source byte stays intact."""
@@ -119,9 +146,9 @@ class ClassificationPromptVersionTests(unittest.TestCase):
             self.assertEqual(original_files, {str(path.relative_to(source_directory)): path.read_bytes()
                                              for path in source_directory.rglob("*") if path.is_file()})
 
-    def test_file_plans_resume_and_repack_both_supported_prompts(self) -> None:
-        """Preserve file scope and byte caps when upgrading either supported file plan."""
-        for prompt_version in ("repository-product-v2", PROMPT_VERSION):
+    def test_file_plans_resume_and_repack_all_supported_prompts(self) -> None:
+        """Preserve file scope and byte caps when upgrading every supported file plan."""
+        for prompt_version in ("repository-product-v2", "repository-product-v3", PROMPT_VERSION):
             with self.subTest(prompt_version=prompt_version), TemporaryDirectory() as temporary_directory:
                 root_directory = Path(temporary_directory)
                 batch_directory, catalog_directory = create_saved_evidence_inputs(root_directory)
