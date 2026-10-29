@@ -84,6 +84,7 @@ def search_dataset_catalog(arguments: argparse.Namespace) -> int:
     if any(getattr(arguments, option) is not None for option in (
         "github_pages", "max_repositories", "max_archive_mb", "max_total_mb", "include_grep_app",
         "github_discovery", "discovery_aliases",
+        "web_search_model", "api_key_file",
     )):
         raise ValueError("GitHub discovery/download options cannot be used with a Sourcegraph search.")
     return search_sourcegraph_catalog(arguments)
@@ -184,6 +185,8 @@ def main(argument_values: list[str] | None = None) -> int:
     search.add_argument("--github-pages", type=int, help="maximum pages per term and GitHub search source, 1-10 (new-run default: 10)")
     search.add_argument("--github-discovery", choices=("code", "code-and-readme"), help="new GitHub runs default to code plus repository/README search; resume retains its saved mode")
     search.add_argument("--discovery-aliases", type=Path, help="optional CSV with short_name,term,source_url to broaden GitHub discovery; aliases do not change local catalog matches")
+    search.add_argument("--web-search-model", help="opt in to paid OpenAI web discovery with this model; saved runs retain their setting")
+    search.add_argument("--api-key-file", type=Path, help="web discovery key file; default lookup includes ./secrets/openai.key")
     search.add_argument("--max-repositories", type=int, help="maximum pinned snapshots (new GitHub run default: 6)")
     search.add_argument("--max-archive-mb", type=int, help="compressed download cap per snapshot (default: 100 decimal MB)")
     search.add_argument("--max-total-mb", type=int, help="total retained snapshot download budget (default: 300 decimal MB)")

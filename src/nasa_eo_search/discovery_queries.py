@@ -200,16 +200,18 @@ def discovery_query_terms(plan: dict[str, Any]) -> list[str]:
             return ordered_terms
 
 
-def discovery_providers(plan: dict[str, Any]) -> tuple[str, ...]:
+def discovery_providers(plan: dict[str, Any], term: str | None = None) -> tuple[str, ...]:
     """Choose discovery services while preserving legacy code-search behavior.
 
     Args:
         plan: Saved settings with an optional github_discovery mode and grep.app
             inclusion flag. Omitted mode uses legacy GitHub code search.
+        term: Optional discovery term. Web requests apply only to canonical
+            dataset names recorded in the frozen web query plan.
 
     Returns:
-        Repository search before code search in code-and-readme mode, followed
-        by grep.app when enabled. Legacy plans return code search first.
+        Optional web discovery first, then repository/code search and grep.app.
+        Plans without web settings retain their original service order.
 
     Raises:
         ValueError: A saved mode or grep.app inclusion flag is unsupported.
@@ -221,4 +223,11 @@ def discovery_providers(plan: dict[str, Any]) -> tuple[str, ...]:
     if type(include_grep_app) is not bool:
         raise ValueError("include_grep_app must be boolean.")
     providers = ("github-repositories", "github") if mode == "code-and-readme" else ("github",)
-    return (*providers, "grep.app") if include_grep_app else providers
+    providers = (*providers, "grep.app") if include_grep_app else providers
+    if "web_discovery" in plan:
+        web_plan = plan["web_discovery"]
+        if not isinstance(web_plan, dict) or not isinstance(web_plan.get("queries"), list):
+            raise ValueError("Invalid saved web discovery settings.")
+        if term is None or any(query.get("short_name") == term for query in web_plan["queries"]):
+            providers = ("openai-web", *providers)
+    return providers
