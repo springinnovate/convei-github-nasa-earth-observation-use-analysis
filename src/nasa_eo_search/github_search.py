@@ -23,6 +23,7 @@ from urllib.request import HTTPSHandler, Request, build_opener
 from nasa_eo_search.batch_files import atomic_batch_output, lock_batch_directory
 from nasa_eo_search.batch_reports import write_protected_csv_rows
 from nasa_eo_search.evidence_context import RejectEvidenceRedirects
+from nasa_eo_search.evidence_credentials import load_openai_api_key
 from nasa_eo_search.discovery_queries import (
     build_discovery_queries, discovery_providers, discovery_query_terms, read_discovery_aliases,
     validate_discovery_alias_record,
@@ -34,13 +35,15 @@ from nasa_eo_search.repository_discovery import (
     validate_repository_name, validate_search_term,
 )
 from nasa_eo_search.repository_scan import MATCHING_RULE, scan_repository_zip
+from nasa_eo_search.web_queries import build_web_discovery_plan
+from nasa_eo_search.web_discovery import search_openai_web, normalize_public_github_repository_url
 
 
 PLAN_DEFAULTS = {"github_pages": 10, "max_repositories": 6, "max_archive_mb": 100,
                  "max_total_mb": 300, "include_grep_app": False}
-DISCOVERY_COLUMNS = ("provider", "term", "query", "page", "attempt", "status", "repository", "file", "url")
+DISCOVERY_COLUMNS = ("provider", "term", "query", "page", "attempt", "status", "repository", "file", "url", "source_urls")
 SEARCH_COLUMNS = ("provider", "term", "dataset_short_names", "alias_source_urls", "query", "status", "pages_saved", "candidate_files", "candidate_repositories",
-                  "auth_visible_total_count", "search_complete", "warnings")
+                  "auth_visible_total_count", "model", "actual_queries", "web_tool_calls", "input_tokens", "output_tokens", "search_complete", "warnings")
 REPOSITORY_COLUMNS = ("repository", "discovered_by", "selected", "commit", "status",
                       "selection_group", "selection_reason", "fork", "size_kb", "stars",
                       "archive_bytes", "files_scanned", "bytes_scanned", "skipped_files", "error")
@@ -207,6 +210,17 @@ def build_github_plan(arguments: argparse.Namespace, catalog: dict, saved: dict 
     if not legacy_plan:
         plan.update({"github_discovery": discovery_mode, "discovery_aliases": aliases,
                      "discovery_queries": queries, "selection_policy": "diverse-repository-names-v1"})
+    requested_web_model = getattr(arguments, "web_search_model", None)
+    if saved is not None and requested_web_model is not None and "web_discovery" not in saved:
+        raise ValueError("This saved run has no web discovery. Choose a new output directory to add it.")
+    saved_web = saved.get("web_discovery") if saved else None
+    if saved is not None and "web_discovery" in saved and not isinstance(saved_web, dict):
+        raise ValueError("Invalid saved web discovery settings.")
+    web_model = requested_web_model if requested_web_model is not None else saved_web.get("model") if saved_web is not None else None
+    if web_model is not None or saved_web is not None:
+        plan["web_discovery"] = build_web_discovery_plan(catalog, names, web_model)
+    elif getattr(arguments, "api_key_file", None) is not None:
+        raise ValueError("--api-key-file requires an enabled --web-search-model for search.")
     if saved is not None:
         comparable_saved = {key: saved.get(key) for key in plan if key != "catalog_directory"}
         comparable_new = {key: value for key, value in plan.items() if key != "catalog_directory"}
@@ -224,7 +238,7 @@ def discovery_receipt_path(output: Path, provider: str, term: str, page: int, at
 
     Args:
         output: Search output directory.
-        provider: ``github``, ``github-repositories``, or ``grep.app``.
+        provider: ``github``, ``github-repositories``, ``grep.app``, or ``openai-web``.
         term: Literal dataset short name or documented discovery alias.
         page: One-based provider page number.
         attempt: One-based request-attempt number.
@@ -295,9 +309,22 @@ def read_discovery_receipts(output: Path, plan: dict) -> list[dict]:
         page, attempt = receipt.get("page"), receipt.get("attempt")
         if (provider not in providers or term not in terms
                 or type(page) is not int or not 1 <= page <= plan["github_pages"]
-                or (provider == "grep.app" and page != 1) or type(attempt) is not int or attempt < 1
+                or (provider in {"grep.app", "openai-web"} and page != 1) or type(attempt) is not int or attempt < 1
                 or receipt.get("status") not in RECEIPT_STATUSES or not isinstance(receipt.get("results"), list)):
             raise ValueError("Invalid saved discovery request metadata.")
+        if provider == "openai-web":
+            query_record = next((record for record in plan["web_discovery"]["queries"] if record["short_name"] == term), None)
+            if (query_record is None or receipt.get("requested_queries") != query_record["queries"]
+                    or receipt.get("query") != "\n".join(query_record["queries"])
+                    or receipt.get("model") != plan["web_discovery"]["model"]):
+                raise ValueError("Saved web discovery request differs from its frozen queries or model.")
+            actual_queries = receipt.get("actual_queries", [])
+            usage = receipt.get("usage", {})
+            if (not isinstance(actual_queries, list) or any(not isinstance(query, str) for query in actual_queries)
+                    or type(receipt.get("web_search_calls", 0)) is not int or receipt.get("web_search_calls", 0) < 0
+                    or not isinstance(usage, dict)
+                    or any(type(usage.get(field, 0)) is not int or usage.get(field, 0) < 0 for field in ("input_tokens", "output_tokens"))):
+                raise ValueError("Invalid saved web search queries or usage counters.")
         if discovery_receipt_path(output, provider, term, page, attempt) != path:
             raise ValueError("Discovery receipt name does not match its request.")
         for result in receipt["results"]:
@@ -306,7 +333,7 @@ def read_discovery_receipts(output: Path, plan: dict) -> list[dict]:
             validate_repository_name(result.get("repository", ""))
             if not isinstance(result.get("file"), str) or not isinstance(result.get("url"), str):
                 raise ValueError("Invalid saved discovery file or URL.")
-            if provider == "github-repositories":
+            if provider in {"github-repositories", "openai-web"}:
                 if result["file"] or result["url"] != "https://" + result["repository"]:
                     raise ValueError("Repository discovery must preserve a repository URL, not a file claim.")
                 metadata = result.get("repository_metadata", {})
@@ -314,6 +341,12 @@ def read_discovery_receipts(output: Path, plan: dict) -> list[dict]:
                         or any(type(metadata.get(field)) is not bool for field in ("fork", "archived"))
                         or any(type(metadata.get(field)) is not int or metadata[field] < 0 for field in ("size_kb", "stars"))):
                     raise ValueError("Invalid public repository discovery metadata.")
+                if provider == "openai-web":
+                    source_urls = result.get("source_urls")
+                    if (not isinstance(source_urls, list) or not source_urls
+                            or any((normalize_public_github_repository_url(source) or "").casefold() != result["repository"].casefold()
+                                   for source in source_urls)):
+                        raise ValueError("Saved web candidates require source URLs for the same public repository.")
         receipts.append(receipt)
     return sorted(receipts, key=lambda row: (row["term"], row["provider"], row["page"], row["attempt"]))
 
@@ -337,13 +370,13 @@ def latest_discovery_receipts(receipts: list[dict]) -> dict[tuple, dict]:
 
 
 def collect_github_discovery(output: Path, plan: dict, receipts: list[dict], maximum_requests: int,
-                             retry_incomplete: bool, ca_bundle: str | None) -> int:
+                             retry_incomplete: bool, ca_bundle: str | None, api_key_file: Path | None = None) -> int:
     """Fetch unfinished search pages and save a record before and after each call.
 
     Request page one for each term before moving to page two. Reuse successful
     saved pages, stop at the invocation's request limit, and update ``receipts``
-    in place as requests start and finish. Optional grep.app calls occur only on
-    page one because that service does not expose pagination here.
+    in place as requests start and finish. Web and grep.app requests occur only
+    on page one. Read the API key only when a new paid request will be made.
 
     Args:
         output: Search output directory already locked by the caller.
@@ -352,7 +385,8 @@ def collect_github_discovery(output: Path, plan: dict, receipts: list[dict], max
         maximum_requests: Maximum discovery calls during this invocation.
         retry_incomplete: Allow one new attempt for a previously failed,
             incomplete, or interrupted page during this invocation.
-        ca_bundle: Optional certificate-authority file for grep.app HTTPS calls.
+        ca_bundle: Optional certificate-authority file for HTTPS service calls.
+        api_key_file: Optional OpenAI key path, never saved in the search plan.
 
     Returns:
         Number of discovery calls made in this invocation.
@@ -364,13 +398,14 @@ def collect_github_discovery(output: Path, plan: dict, receipts: list[dict], max
 
     latest = latest_discovery_receipts(receipts)
     calls = 0
+    api_key = None
     for page in range(1, plan["github_pages"] + 1):
         for term in discovery_query_terms(plan):
-            providers = tuple(provider for provider in discovery_providers(plan) if page == 1 or provider != "grep.app")
+            providers = tuple(provider for provider in discovery_providers(plan, term) if page == 1 or provider not in {"grep.app", "openai-web"})
             for provider in providers:
                 identity = (provider, term, page)
                 prior = latest.get(identity)
-                if provider != "grep.app" and page > 1:
+                if provider not in {"grep.app", "openai-web"} and page > 1:
                     previous = latest.get((provider, term, page - 1))
                     if (not previous or previous["status"] in {"running", "error", "incomplete"}
                             or not previous.get("has_more", False)):
@@ -379,11 +414,17 @@ def collect_github_discovery(output: Path, plan: dict, receipts: list[dict], max
                     continue
                 if calls >= maximum_requests:
                     return calls
+                if provider == "openai-web" and api_key is None:
+                    api_key = load_openai_api_key(api_key_file)
                 attempt = prior["attempt"] + 1 if prior else 1
                 path = discovery_receipt_path(output, provider, term, page, attempt)
                 started = {"provider": provider, "term": term, "page": page, "attempt": attempt,
                            "status": "running", "results": [], "warnings": ["Request started; final response not yet saved."],
                            "started_at": datetime.now(timezone.utc).isoformat()}
+                if provider == "openai-web":
+                    query_record = next(record for record in plan["web_discovery"]["queries"] if record["short_name"] == term)
+                    started.update({"query": "\n".join(query_record["queries"]), "requested_queries": query_record["queries"],
+                                    "model": plan["web_discovery"]["model"]})
                 save_discovery_receipt(path, started)
                 receipts.append(started)
                 print(f"Discovering {term!r} with {provider}, page {page} ({calls + 1}/{maximum_requests})...", file=sys.stderr, flush=True)
@@ -391,6 +432,9 @@ def collect_github_discovery(output: Path, plan: dict, receipts: list[dict], max
                     response = search_github_code(term, max_pages=1, start_page=page)
                 elif provider == "github-repositories":
                     response = search_github_repositories(term, max_pages=1, start_page=page)
+                elif provider == "openai-web":
+                    response = search_openai_web(term, queries=query_record["queries"], model=plan["web_discovery"]["model"],
+                                                 api_key=api_key, ca_bundle_path=ca_bundle)
                 else:
                     response = search_grep_app(term, ca_bundle_path=ca_bundle)
                 finished = {**started, **response, "page": page, "attempt": attempt}
@@ -447,7 +491,7 @@ def reconcile_snapshot_repositories(receipts: list[dict], repositories: list[dic
         if query["term"] not in terms:
             terms.append(query["term"])
     candidate_lists = []
-    providers = ("github-repositories", "github", "grep.app") if diverse_selection else ("github", "grep.app")
+    providers = ("openai-web", "github-repositories", "github", "grep.app") if diverse_selection else ("github", "grep.app")
     queue_batches = ([(terms, (provider,)) for provider in providers for terms in terms_by_dataset.values()]
                      if diverse_selection else [(terms, providers) for terms in terms_by_dataset.values()])
     for terms, queued_providers in queue_batches:
@@ -752,7 +796,7 @@ def summarize_discovery_queries(plan: dict, receipts: list[dict]) -> list[dict]:
     query_records = plan.get("discovery_queries", [{"short_name": term, "term": term, "source_url": ""}
                                                    for term in plan["discovery_terms"]])
     for term in discovery_query_terms(plan):
-        for provider in discovery_providers(plan):
+        for provider in discovery_providers(plan, term):
             pages = sorted((receipt for identity, receipt in latest.items() if identity[:2] == (provider, term)),
                            key=lambda receipt: receipt["page"])
             status = "pending"
@@ -762,7 +806,7 @@ def summarize_discovery_queries(plan: dict, receipts: list[dict]) -> list[dict]:
                     status = "error"
                 elif any(receipt["status"] == "incomplete" for receipt in pages):
                     status = "incomplete"
-                elif provider == "grep.app":
+                elif provider in {"grep.app", "openai-web"}:
                     status = "limited"
                 elif last.get("has_more", False):
                     status = "capped" if last["page"] >= plan["github_pages"] else "pending"
@@ -777,6 +821,11 @@ def summarize_discovery_queries(plan: dict, receipts: list[dict]) -> list[dict]:
                          "query": pages[-1].get("query", "") if pages else "",
                          "status": status, "pages_saved": len(pages), "candidate_repositories": len(repositories),
                          "candidate_files": len(matches), "auth_visible_total_count": pages[-1].get("total_count", "") if pages else "",
+                         "model": pages[-1].get("model", "") if pages else "",
+                         "actual_queries": "\n".join(query for receipt in pages for query in receipt.get("actual_queries", [])),
+                         "web_tool_calls": sum(receipt.get("web_search_calls", 0) for receipt in pages),
+                         "input_tokens": sum(receipt.get("usage", {}).get("input_tokens", 0) for receipt in pages),
+                         "output_tokens": sum(receipt.get("usage", {}).get("output_tokens", 0) for receipt in pages),
                          "search_complete": False, "warnings": "\n".join(warnings)})
     return rows
 
@@ -831,10 +880,20 @@ def publish_github_reports(output: Path, plan: dict, catalog: dict, receipts: li
         "warnings": ["Discovery indexes, page caps, and the repository sample do not cover all public GitHub code.",
                      "Snapshot completion describes only readable saved files; exclusions are retained in scan receipts."],
     }
+    if "web_discovery" in plan:
+        web_receipts = [receipt for receipt in receipts if receipt["provider"] == "openai-web"]
+        summary["web_discovery"] = {
+            "model": plan["web_discovery"]["model"], "request_attempts_saved": len(web_receipts),
+            "web_tool_calls_reported": sum(receipt.get("web_search_calls", 0) for receipt in web_receipts),
+            "input_tokens_reported": sum(receipt.get("usage", {}).get("input_tokens", 0) for receipt in web_receipts),
+            "output_tokens_reported": sum(receipt.get("usage", {}).get("output_tokens", 0) for receipt in web_receipts),
+            "note": "Paid model requests; reported usage may be unavailable for interrupted or failed responses. Web sources are discovery leads, not verified file matches.",
+        }
     save_github_json(output / "summary.json", summary)
     save_github_json(output / "snapshots.json", {"schema_version": 1, "repositories": repositories})
     discovery_rows = [{"provider": receipt["provider"], "term": receipt["term"], "query": receipt.get("query", ""), "page": receipt["page"],
-                       "attempt": receipt["attempt"], "status": receipt["status"], **match}
+                       "attempt": receipt["attempt"], "status": receipt["status"], **match,
+                       "source_urls": "; ".join(match.get("source_urls", []))}
                       for receipt in receipts for match in receipt["results"]]
     repository_rows = [{**row, **row.get("discovery_metadata", {}), **row["metrics"], "discovered_by": "; ".join(row["discovered_by"])} for row in repositories]
     write_protected_csv_rows(output / "discovery.csv", DISCOVERY_COLUMNS, discovery_rows)
@@ -893,6 +952,9 @@ def search_github_catalog(arguments: argparse.Namespace) -> int:
           f"mode {plan.get('github_discovery', 'code')}; at most {maximum_requests} new calls this run. "
           f"Local scan: all {len(products)} catalog datasets in at most {plan['max_repositories']} pinned repositories.",
           file=sys.stderr, flush=True)
+    if "web_discovery" in plan:
+        print(f"Paid web discovery enabled with {plan['web_discovery']['model']}: at most two web tool calls per new model request; "
+              "requests count toward --max-requests. Saved web results are reused.", file=sys.stderr, flush=True)
     if getattr(arguments, "dry_run", False):
         return 0
     if saved is None:
@@ -923,7 +985,8 @@ def search_github_catalog(arguments: argparse.Namespace) -> int:
         try:
             publish_github_reports(output, plan, catalog, receipts, repositories, 0, "running")
             requests_this_run = collect_github_discovery(output, plan, receipts, maximum_requests,
-                                                       getattr(arguments, "retry_incomplete", False), arguments.ca_bundle)
+                                                       getattr(arguments, "retry_incomplete", False), arguments.ca_bundle,
+                                                       getattr(arguments, "api_key_file", None))
             repositories = reconcile_snapshot_repositories(receipts, repositories, plan)
             save_github_json(output / "snapshots.json", {"schema_version": 1, "repositories": repositories})
             scan_selected_snapshots(output, plan, catalog, repositories,
