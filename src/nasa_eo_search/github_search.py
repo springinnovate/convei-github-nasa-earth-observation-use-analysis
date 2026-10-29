@@ -694,6 +694,8 @@ def publish_github_reports(output: Path, plan: dict, catalog: dict, receipts: li
     write_protected_csv_rows(output / "searches.csv", SEARCH_COLUMNS, search_rows)
     write_protected_csv_rows(output / "repositories.csv", REPOSITORY_COLUMNS, repository_rows)
     source_plan = read_snapshot_evidence_groups(output, allow_running=True)
+    summary["dataset_identity_policy"] = source_plan["dataset_identity_policy"]
+    summary["identity_filtering"] = source_plan["identity_filtering"]
     matches = snapshot_match_rows(source_plan)
     write_protected_csv_rows(output / "matches.csv", SNAPSHOT_MATCH_COLUMNS, matches)
     summary["match_rows"] = len(matches)

@@ -17,7 +17,7 @@ from nasa_eo_search.evidence_model import CLASSIFICATION_PROMPT, PROMPT_VERSION,
 from nasa_eo_search.evidence_reports import load_evidence_plan, save_evidence_json, write_evidence_reports
 from nasa_eo_search.pipeline_tables import build_file_match_row
 from nasa_eo_search.sourcegraph import build_tls_context
-from nasa_eo_search.snapshot_evidence import read_snapshot_evidence_groups
+from nasa_eo_search.snapshot_evidence import CATALOG_IDENTITY_POLICY, read_snapshot_evidence_groups
 
 
 def resolve_file_classification_catalog(batch_directory: Path, catalog_directory: Path | None) -> Path:
@@ -78,6 +78,9 @@ def split_repository_groups_into_files(source_plan: dict[str, Any]) -> list[dict
             if snapshot_backend:
                 file_group["warnings"].extend(file_record["snapshot_warnings"])
                 file_group["snapshot_evidence"] = copy.deepcopy(file_record["snapshot_evidence"])
+                for field in ("identifier_identity_rules", "identifier_valid_occurrences"):
+                    if field in file_record:
+                        file_group[field] = copy.deepcopy(file_record[field])
             elif not any(source["latest_attempt"] for source in file_record["sources"]):
                 file_group["warnings"].append("Some evidence appears only in historical search attempts.")
             if not snapshot_backend and any(source["status"] != COMPLETED_SEARCH for source in file_record["sources"]):
@@ -109,6 +112,8 @@ def identify_file_classification_source(source_plan: dict[str, Any]) -> str:
     catalog_summary = source_plan["catalog_summary"]
     return identify_evidence({
         "source_identity_version": 1, "groups": source_plan["groups"],
+        **({"dataset_identity_policy": source_plan["dataset_identity_policy"]}
+           if "dataset_identity_policy" in source_plan else {}),
         "catalog_status": source_plan["catalog_status"], "search_scope": source_plan["search_scope"],
         "selected_products": source_plan["selected_products"],
         "source_product_queries": source_plan["source_product_queries"],
@@ -260,15 +265,24 @@ def classify_file_matches(arguments: argparse.Namespace) -> int:
     batch_directory = arguments.batch_directory.resolve()
     output_directory = arguments.output.resolve()
     source_backend = read_evidence_json(batch_directory / "plan.json").get("backend")
+    saved_plan = load_evidence_plan(output_directory) if output_directory.exists() else None
     if source_backend == "github":
-        source_plan = read_snapshot_evidence_groups(batch_directory, arguments.catalog)
+        identity_policy = saved_plan.get("dataset_identity_policy") if saved_plan is not None else CATALOG_IDENTITY_POLICY
+        if identity_policy not in (None, CATALOG_IDENTITY_POLICY):
+            raise ValueError("Unsupported saved dataset identity policy; choose a new output directory.")
+        source_plan = read_snapshot_evidence_groups(
+            batch_directory, arguments.catalog, apply_catalog_identity=identity_policy is not None,
+        )
+        if saved_plan is not None and identity_policy is None:
+            print("Resuming original identifier associations. Choose a new --output directory to apply catalog identity filtering.",
+                  file=sys.stderr)
     else:
         catalog_directory = resolve_file_classification_catalog(batch_directory, arguments.catalog)
         source_plan = read_product_evidence_groups(batch_directory, catalog_directory)
     if read_evidence_json(batch_directory / "summary.json") != source_plan["source_batch_summary"]:
         raise ValueError("The saved search changed while reading it; finish or stop the search before classification.")
-    if output_directory.exists():
-        plan = load_evidence_plan(output_directory)
+    if saved_plan is not None:
+        plan = saved_plan
         if plan.get("assessment_unit") != "file":
             raise ValueError("This output contains repository-level assessments. Choose a new output directory for file classification.")
         if plan.get("source_evidence_id") != identify_file_classification_source(source_plan):

@@ -180,6 +180,17 @@ class DatasetVersionValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not explicitly associated"):
             validate_classification(judgment, packet)
 
+    def test_smap_collection_versions_require_the_complete_product_path(self) -> None:
+        """Accept enhanced SMAP versions only for the exact enhanced product."""
+        for version in ("006", "005_RAW"):
+            source_text = f"ee.ImageCollection('NASA/SMAP/SPL3SMP_E/{version}')"
+            with self.subTest(version=version):
+                self.assertTrue(version_occurs_with_product(version, source_text, "SPL3SMP_E"))
+                self.assertFalse(version_occurs_with_product(version, source_text, "SPL3SMP"))
+                self.assertFalse(version_occurs_with_product(version, source_text, "SPL3SMP_E_2"))
+                self.assertFalse(version_occurs_with_product(version, source_text.replace(version, version + "1"), "SPL3SMP_E"))
+        self.assertFalse(version_occurs_with_product("006", "OTHER/SPL3SMP_E/006", "SPL3SMP_E"))
+
     def test_csv_named_columns_associate_the_exact_product_and_version(self) -> None:
         """Accept explicit short-name and version values from one complete CSV row."""
         accepted_sources = (
@@ -199,6 +210,28 @@ class DatasetVersionValidationTests(unittest.TestCase):
         judgment["observed_versions"] = [{"version": "009", "evidence_ids": ["E1"]}]
         self.assertEqual(validate_classification(judgment, packet)["observed_versions"],
                          judgment["observed_versions"])
+
+    def test_explicit_product_version_urls_keep_sibling_products_separate(self) -> None:
+        """Accept NSIDC version URLs only for their complete product identifier."""
+        source_text = "https://nsidc.org/data/data-access-tool/SPL3SMP_E/versions/6"
+        self.assertTrue(version_occurs_with_product("6", source_text, "SPL3SMP_E"))
+        self.assertFalse(version_occurs_with_product("6", source_text, "SPL3SMP"))
+        self.assertFalse(version_occurs_with_product("6", source_text + "1", "SPL3SMP_E"))
+        self.assertFalse(version_occurs_with_product("6", source_text.replace("/versions/", "/"), "SPL3SMP_E"))
+        self.assertFalse(version_occurs_with_product("6", source_text.replace("SPL3SMP_E", "OTHER_SPL3SMP_E"), "SPL3SMP_E"))
+
+    def test_adjacent_catalog_title_and_version_fields_require_exact_product(self) -> None:
+        """Recognize a cited JSONnet version field without borrowing other objects."""
+        source_text = "  title: 'SPL3SMP_E.006 Soil Moisture',\n\n  version: '6',\n"
+        self.assertTrue(version_occurs_with_product("6", source_text, "SPL3SMP_E"))
+        self.assertFalse(version_occurs_with_product("6", source_text, "SPL3SMP"))
+        self.assertFalse(version_occurs_with_product("6", source_text.replace("SPL3SMP_E.", "SPL3SMP_E_OTHER."), "SPL3SMP_E"))
+        self.assertFalse(version_occurs_with_product("6", source_text.replace("'6'", "'61'"), "SPL3SMP_E"))
+        self.assertFalse(version_occurs_with_product("6", source_text.replace("\n\n", "\n}, {\n"), "SPL3SMP_E"))
+        self.assertFalse(version_occurs_with_product("6", source_text.replace("\n\n", "\n  software: 'helper',\n"), "SPL3SMP_E"))
+        for sibling_title in ("SPL3SMP_E.OTHER", "SPL3SMP_E/OTHER", "SPL3SMP_E.006_OTHER", "SPL3SMP_E.006extra"):
+            with self.subTest(sibling_title=sibling_title):
+                self.assertFalse(version_occurs_with_product("6", source_text.replace("SPL3SMP_E.006", sibling_title), "SPL3SMP_E"))
 
     def test_csv_versions_cannot_come_from_other_rows_or_numeric_columns(self) -> None:
         """Reject sibling products, partial values, and numbers outside the version column."""

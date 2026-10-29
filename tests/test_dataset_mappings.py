@@ -4,7 +4,10 @@ from copy import deepcopy
 import unittest
 
 from nasa_eo_search.evidence_context import make_line_evidence
-from nasa_eo_search.evidence_packaging import measure_packet_bytes, package_evidence_blocks
+from nasa_eo_search.evidence_packaging import (
+    filter_packet_identifier_mappings, find_validated_block_identifier_terms,
+    measure_packet_bytes, package_evidence_blocks,
+)
 
 
 def make_mapping_group(short_name: str = "ASF_ECMWF_SMST", concept_id: str = "C3653529349-ASF") -> dict:
@@ -98,6 +101,116 @@ class DatasetMappingTests(unittest.TestCase):
         replace_matching_text(group, 'open("atl03_007.h5")')
         packet = package_evidence_blocks(group, 4096)[0]
         self.assertEqual([mapping["term"] for mapping in packet["product"]["matched_identifiers"]], ["ATL03"])
+
+    def test_foreign_longer_identifier_does_not_supply_product_mapping(self) -> None:
+        """Exclude a base-product mapping when only the enhanced product occurs."""
+        group = make_mapping_group("SPL3SMP", "C100-ASF")
+        group["identifier_identity_rules"] = {
+            "SPL3SMP": [{"term": "SPL3SMP_E", "same_product": False}],
+        }
+        replace_matching_text(group, 'read("NASA/SMAP/SPL3SMP_E/006")')
+        packet = package_evidence_blocks(group, 4096)[0]
+        self.assertEqual(packet["product"]["matched_identifiers"], [])
+        self.assertEqual(packet["product"]["identifier_identity_rules"], group["identifier_identity_rules"])
+        self.assertIn("distinct catalog datasets", packet["product"]["identifier_relationship_note"])
+
+    def test_independent_base_occurrence_keeps_mapping_beside_foreign_product(self) -> None:
+        """Keep actual base mentions while excluding enhanced-only packet context."""
+        group = make_mapping_group("SPL3SMP", "C100-ASF")
+        group["identifier_identity_rules"] = {
+            "SPL3SMP": [{"term": "SPL3SMP_E", "same_product": False}],
+        }
+        replace_matching_text(group, 'compare("SPL3SMP", "SPL3SMP_E")')
+        packet = package_evidence_blocks(group, 4096)[0]
+        self.assertEqual([mapping["term"] for mapping in packet["product"]["matched_identifiers"]], ["SPL3SMP"])
+        foreign_context = deepcopy(packet)
+        foreign_context["evidence"] = [{"text": 'read("SPL3SMP_E")', "kind": "enclosing_code"}]
+        filtered = filter_packet_identifier_mappings(foreign_context)
+        self.assertEqual(filtered["product"]["matched_identifiers"], [])
+        self.assertEqual(len(foreign_context["product"]["matched_identifiers"]), 1)
+
+    def test_same_product_alias_still_supplies_base_mapping(self) -> None:
+        """Preserve a base-product mapping inside its own catalog entry identifier."""
+        group = make_mapping_group("ATL03", "C100-ASF")
+        group["identifier_identity_rules"] = {
+            "ATL03": [{"term": "ATL03_1", "same_product": True}],
+        }
+        replace_matching_text(group, 'read("ATL03_1")')
+        packet = package_evidence_blocks(group, 4096)[0]
+        self.assertEqual([mapping["term"] for mapping in packet["product"]["matched_identifiers"]], ["ATL03", "ATL03_1"])
+
+    def test_empty_identity_rules_preserve_original_packet_bytes(self) -> None:
+        """Keep unchanged requests cache-compatible when no identity rules apply."""
+        group = make_mapping_group()
+        original_packets = package_evidence_blocks(deepcopy(group), 4096)
+        group["identifier_identity_rules"] = {}
+        self.assertEqual(package_evidence_blocks(group, 4096), original_packets)
+
+    def test_packet_splitting_keeps_foreign_identifiers_whole(self) -> None:
+        """Do not turn a split enhanced identifier into a false base mapping."""
+        group = make_mapping_group("SPL3SMP", "C100-ASF")
+        group["identifier_identity_rules"] = {
+            "SPL3SMP": [{"term": "SPL3SMP_E", "same_product": False}],
+        }
+        text = 'read("SPL3SMP") ' + ('"SPL3SMP_E" ' + 'padding ' * 21) * 45
+        replace_matching_text(group, text)
+        packets = package_evidence_blocks(group, 3000)
+        fragments = [block["text"] for packet in packets for block in packet["evidence"]]
+        self.assertGreater(len(packets), 1)
+        self.assertEqual("".join(fragments), text)
+        self.assertEqual(sum(fragment.count("SPL3SMP_E") for fragment in fragments), text.count("SPL3SMP_E"))
+        self.assertEqual(sum(bool(packet["product"]["matched_identifiers"]) for packet in packets), 1)
+        self.assertTrue(all(measure_packet_bytes(packet) <= 3000 for packet in packets))
+
+    def test_clipped_prefix_cannot_supply_a_validated_source_mapping(self) -> None:
+        """Reject a complete-looking prefix absent from accepted original positions."""
+        group = make_mapping_group("SPL3SMP", "C100-ASF")
+        group["identifier_identity_rules"] = {
+            "SPL3SMP": [{"term": "SPL3SMP_E", "same_product": False}],
+        }
+        replace_matching_text(group, "SPL3SMP")
+        group["identifier_valid_occurrences"] = {}
+        packet = package_evidence_blocks(group, 4096)[0]
+        self.assertEqual(packet["product"]["matched_identifiers"], [])
+
+    def test_fragment_identifier_trace_uses_original_unicode_offsets(self) -> None:
+        """Trace a split occurrence back to its source line and character position."""
+        block = {
+            "text": "é SPL3SMP", "text_offset": 11,
+            "locations": [{"source_line_map": [{
+                "line_number": 20, "character_offset": 30, "text_start": 4, "text_end": 21,
+            }]}],
+        }
+        positions = {"SPL3SMP": [{"line_number": 20, "character_offset": 39, "end_offset": 46}]}
+        self.assertEqual(find_validated_block_identifier_terms(block, positions), {"SPL3SMP"})
+        block["text_offset"] = 12
+        self.assertEqual(find_validated_block_identifier_terms(block, positions), set())
+        block["text_offset"] = 11
+        block["representation"] = "decoded_notebook_fragment"
+        self.assertEqual(find_validated_block_identifier_terms(block, positions), set())
+
+    def test_context_fragments_do_not_borrow_another_lines_accepted_mapping(self) -> None:
+        """Do not remap a clipped context prefix using a genuine hit elsewhere."""
+        group = make_mapping_group("SPL3SMP", "C100-ASF")
+        group["identifier_identity_rules"] = {
+            "SPL3SMP": [{"term": "SPL3SMP_E", "same_product": False}],
+        }
+        replace_matching_text(group, "SPL3SMP")
+        group["identifier_valid_occurrences"] = {
+            "SPL3SMP": [{"line_number": 20, "character_offset": 0, "end_offset": 7}],
+        }
+        group["evidence"].extend(make_line_evidence(group["files"][0], [{
+            "line_number": 70, "text": "# context " * 500 + " SPL3SMP",
+        }], "enclosing_code"))
+        packets = package_evidence_blocks(group, 3000)
+        context_packets = [packet for packet in packets if all(
+            block["kind"] == "enclosing_code" for block in packet["evidence"]
+        )]
+        self.assertTrue(context_packets)
+        self.assertTrue(any("SPL3SMP" in block["text"] for packet in context_packets for block in packet["evidence"]))
+        self.assertTrue(all(not packet["product"]["matched_identifiers"] for packet in context_packets))
+        self.assertEqual(sum(bool(packet["product"]["matched_identifiers"]) for packet in packets), 1)
+        self.assertTrue(all("identifier_valid_occurrences" not in packet["product"] for packet in packets))
 
     def test_unverified_associations_are_not_invented_from_candidate_text(self) -> None:
         """Reject provenance outside this product or inconsistent source fields."""

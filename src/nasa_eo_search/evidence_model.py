@@ -173,8 +173,11 @@ def version_occurs_with_product(version: str, evidence_text: str, product_name: 
     Inspect only cited source text, never the classifier's catalog metadata.
     This is a syntactic safeguard, not proof of version compatibility.
     Require a filename/URL-style product token or an explicit version marker.
-    This includes ``MODIS/version/product`` collection IDs, ``V06 (product)``
-    titles, a terminal marker in the complete product name, and named CSV columns.
+    This includes ``MODIS/version/product`` and ``NASA/SMAP/product/version``
+    collection IDs, explicit ``product/versions/number`` URLs, ``V06 (product)``
+    titles, terminal product-name markers, adjacent catalog title/version fields,
+    and named CSV columns. SMAP paths require the complete short name so the
+    enhanced product cannot supply a base-product version.
 
     Args:
         version: Exact version token reported by the model.
@@ -188,6 +191,25 @@ def version_occurs_with_product(version: str, evidence_text: str, product_name: 
         return False
     if version_occurs_in_product_csv(version, evidence_text, product_name):
         return True
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
+        product_version_url = (r"(?<![A-Za-z0-9_.-])" + re.escape(product_name)
+                               + r"/versions?/" + re.escape(version) + r"(?![A-Za-z0-9_.-])")
+        if re.search(product_version_url, evidence_text, re.IGNORECASE):
+            return True
+        # JSONnet catalog titles name the dataset and put its version in the
+        # immediately following field. Do not bridge another field or object.
+        adjacent_title_version = (
+            r"(?m)^[ \t]*title[ \t]*:[ \t]*(['\"])" + re.escape(product_name)
+            + r"(?:\.[0-9]+(?:\.[0-9]+)*)?(?=[ \t'\"])[^'\"\r\n]*\1[ \t]*,[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+            + r"[ \t]*version[ \t]*:[ \t]*(['\"])" + re.escape(version) + r"\2[ \t]*(?:,|$)"
+        )
+        if re.search(adjacent_title_version, evidence_text, re.IGNORECASE | re.ASCII):
+            return True
+    if re.fullmatch(r"[0-9]{3}(?:_RAW)?", version):
+        smap_collection_pattern = (r"(?<![A-Za-z0-9_-])NASA/SMAP/" + re.escape(product_name)
+                                   + "/" + re.escape(version) + r"(?![A-Za-z0-9_.-])")
+        if re.search(smap_collection_pattern, evidence_text, re.IGNORECASE):
+            return True
     if re.fullmatch(r"[0-9]{3}", version):
         earth_engine_pattern = (r"(?<![A-Za-z0-9_-])MODIS/" + re.escape(version) + "/"
                                 + re.escape(product_name) + r"(?![A-Za-z0-9_.-])")
