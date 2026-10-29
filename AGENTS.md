@@ -27,6 +27,8 @@
 
 ## Git branches
 
+- Create a GitHub issue before making any code changes, including fixes found
+  during testing or pilot runs. This applies to all work on this project.
 - New features: `feature/{issue-number}-{short-description}`.
 - Fixes: `bugfix/{issue-number}-{short-description}`.
 - Maintenance, documentation, infrastructure, and refactors:
