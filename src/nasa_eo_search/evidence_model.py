@@ -1,5 +1,7 @@
 """Request and validate evidence-grounded OpenAI classifications."""
 
+import csv
+from io import StringIO
 import json
 import re
 from typing import Any
@@ -135,12 +137,44 @@ CLASSIFICATION_SCHEMA = {
 }
 
 
+def version_occurs_in_product_csv(version: str, evidence_text: str, product_name: str) -> bool:
+    """Check named product/version columns in cited repository CSV source.
+
+    Require a header with exactly one short_name and version column, followed
+    by a complete row associating the exact values. Quoted fields are parsed
+    as data; other nearby rows and unrelated numeric columns cannot supply
+    the version. This never reads the classifier's catalog metadata.
+
+    Args:
+        version: Exact observed version text to find in the version column.
+        evidence_text: Cited repository text beginning with the CSV header.
+        product_name: Product short name to find in the same row.
+
+    Returns:
+        True when a complete row explicitly associates the product and version;
+        False for absent headers, malformed CSV, or unmatched values.
+    """
+    try:
+        rows = csv.reader(StringIO(evidence_text), strict=True)
+        columns = [value.strip().casefold() for value in next(rows, [])]
+        if columns.count("short_name") != 1 or columns.count("version") != 1:
+            return False
+        product_column, version_column = columns.index("short_name"), columns.index("version")
+        return any(len(row) == len(columns)
+                   and row[product_column].strip().casefold() == product_name.casefold()
+                   and row[version_column].strip() == version for row in rows)
+    except csv.Error:
+        return False
+
+
 def version_occurs_with_product(version: str, evidence_text: str, product_name: str) -> bool:
     """Check for a bounded version token near an explicit product identifier.
 
-    This rejects metadata-only observations and unrelated numeric substrings; it
-    is a syntactic safeguard, not proof that a model interpreted a version correctly.
-    Require an explicit version marker or a filename/URL-style product token.
+    Inspect only cited source text, never the classifier's catalog metadata.
+    This is a syntactic safeguard, not proof of version compatibility.
+    Require a filename/URL-style product token or an explicit version marker.
+    This includes ``MODIS/version/product`` collection IDs, ``V06 (product)``
+    titles, a terminal marker in the complete product name, and named CSV columns.
 
     Args:
         version: Exact version token reported by the model.
@@ -152,7 +186,28 @@ def version_occurs_with_product(version: str, evidence_text: str, product_name: 
     """
     if not product_name:
         return False
+    if version_occurs_in_product_csv(version, evidence_text, product_name):
+        return True
+    if re.fullmatch(r"[0-9]{3}", version):
+        earth_engine_pattern = (r"(?<![A-Za-z0-9_-])MODIS/" + re.escape(version) + "/"
+                                + re.escape(product_name) + r"(?![A-Za-z0-9_.-])")
+        if re.search(earth_engine_pattern, evidence_text, re.IGNORECASE):
+            return True
     product_pattern = re.compile(r"(?<![A-Za-z0-9])" + re.escape(product_name) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+    numeric_version = version[1:] if re.fullmatch(r"v[0-9]+(?:\.[0-9]+)*", version, re.IGNORECASE) else version
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", numeric_version):
+        # Only explicit version markers qualify, never an arbitrary numeric
+        # suffix such as a sensor number in a dataset identifier.
+        terminal_version = r"[-_.]v" + re.escape(numeric_version) + r"$"
+        exact_product = r"(?<![A-Za-z0-9_.-])" + re.escape(product_name) + r"(?![A-Za-z0-9_.-])"
+        if re.search(terminal_version, product_name, re.IGNORECASE) and re.search(exact_product, evidence_text, re.IGNORECASE):
+            return True
+        marked_version = (re.escape(version) if version != numeric_version else
+                          r"(?:version|ver\.?|v)[ \t]*[:=]?[ \t]*" + re.escape(version))
+        title_pattern = (r"(?<![A-Za-z0-9])" + marked_version
+                         + r"[ \t]+\([ \t]*" + re.escape(product_name) + r"[ \t]*\)")
+        if re.search(title_pattern, evidence_text, re.IGNORECASE):
+            return True
     for product_match in product_pattern.finditer(evidence_text):
         nearby_text = evidence_text[max(0, product_match.start() - 120):product_match.end() + 200]
         explicit_pattern = (re.escape(product_name) + r"[ \t]*(?:[-:(,][ \t]*)?"
@@ -160,9 +215,10 @@ def version_occurs_with_product(version: str, evidence_text: str, product_name: 
                             + re.escape(version) + r"(?![A-Za-z0-9])")
         if re.search(explicit_pattern, nearby_text, re.IGNORECASE):
             return True
+        version_ending = r"(?=[_./\s\"')\]},;:>]|$)"
         filename_pattern = (re.escape(product_name) + r"[_.][A-Za-z0-9_.-]{0,160}?[_.]"
-                            + re.escape(version) + r"(?=[_./\s\"']|$)")
-        immediate_pattern = re.escape(product_name) + r"[_.]" + re.escape(version) + r"(?=[_./\s\"']|$)"
+                            + re.escape(version) + version_ending)
+        immediate_pattern = re.escape(product_name) + r"[_.]" + re.escape(version) + version_ending
         if re.search(filename_pattern, nearby_text, re.IGNORECASE) or re.search(immediate_pattern, nearby_text, re.IGNORECASE):
             return True
     return False
