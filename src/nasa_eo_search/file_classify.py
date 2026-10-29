@@ -16,6 +16,7 @@ from nasa_eo_search.evidence_model import CLASSIFICATION_PROMPT, PROMPT_VERSION,
 from nasa_eo_search.evidence_reports import load_evidence_plan, save_evidence_json, write_evidence_reports
 from nasa_eo_search.pipeline_tables import build_file_match_row
 from nasa_eo_search.sourcegraph import build_tls_context
+from nasa_eo_search.snapshot_evidence import read_snapshot_evidence_groups
 
 
 def resolve_file_classification_catalog(batch_directory: Path, catalog_directory: Path | None) -> Path:
@@ -43,14 +44,16 @@ def resolve_file_classification_catalog(batch_directory: Path, catalog_directory
 
 
 def split_repository_groups_into_files(source_plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Keep every dataset/file/revision match independent during classification.
+    """Split repository/product groups into one group per matching file and commit.
 
-    Preserve the original search table row before adding context. File-specific
-    provenance warnings are recalculated so another matching file cannot affect
-    this assessment. Product-search and source-catalog coverage still apply.
+    Copy each original search-table row so the classification CSV can retain it.
+    Recalculate warnings about failed or historical searches for each file,
+    rather than carrying over warnings that apply only to another file. Keep
+    warnings about catalog coverage and the product search on every group.
 
     Args:
-        source_plan: Unenriched repository/product groups from saved search data.
+        source_plan: Saved-search data containing repository/product groups,
+            each with a ``files`` list and search-status warnings.
 
     Returns:
         Independent groups, each containing exactly one matched file and revision.
@@ -63,33 +66,40 @@ def split_repository_groups_into_files(source_plan: dict[str, Any]) -> list[dict
     }
     for repository_group in source_plan["groups"]:
         for file_record in repository_group["files"]:
-            match_row = build_file_match_row(repository_group, file_record)
+            snapshot_backend = source_plan.get("backend") == "github"
+            match_row = (copy.deepcopy(file_record["snapshot_match_row"]) if snapshot_backend
+                         else build_file_match_row(repository_group, file_record))
             file_group = copy.deepcopy({field: value for field, value in repository_group.items() if field != "files"})
             file_group["files"] = [copy.deepcopy(file_record)]
             file_group["group_id"] = match_row["match_id"]
             file_group["match_row"] = match_row
             file_group["warnings"] = [warning for warning in repository_group["warnings"] if warning not in file_provenance_warnings]
-            if not any(source["latest_attempt"] for source in file_record["sources"]):
+            if snapshot_backend:
+                file_group["warnings"].extend(file_record["snapshot_warnings"])
+                file_group["snapshot_evidence"] = copy.deepcopy(file_record["snapshot_evidence"])
+            elif not any(source["latest_attempt"] for source in file_record["sources"]):
                 file_group["warnings"].append("Some evidence appears only in historical search attempts.")
-            if any(source["status"] != COMPLETED_SEARCH for source in file_record["sources"]):
+            if not snapshot_backend and any(source["status"] != COMPLETED_SEARCH for source in file_record["sources"]):
                 file_group["warnings"].append("Some evidence came from partial or damaged search attempts; inspect provenance.")
             file_groups.append(file_group)
     return file_groups
 
 
 def identify_file_classification_source(source_plan: dict[str, Any]) -> str:
-    """Fingerprint evidence and coverage independently of report regeneration or location.
+    """Calculate the hash used to check that classification inputs have not changed.
 
     Match text, file revisions, product metadata, source-query status, and relevant
     catalog coverage remain part of the identity. Generated batch summaries,
     elapsed times, timestamps, and local directory paths do not. Rewriting reports
-    or relocating an unchanged catalog therefore does not invalidate paid receipts.
+    or relocating an unchanged catalog therefore does not prevent reuse of
+    saved model responses.
 
     Args:
-        source_plan: Unenriched saved-search groups and source metadata.
+        source_plan: Saved file matches, product descriptions, and search/catalog
+            status, before adding downloaded context or classification results.
 
     Returns:
-        Stable semantic source hash used to validate file-classification resumes.
+        SHA-256 hex digest compared with ``source_evidence_id`` when resuming.
     """
     catalog_coverage_fields = (
         "schema_version", "status", "source_url", "scope", "short_name_filter", "grouping",
@@ -109,27 +119,35 @@ def build_file_classification_plan(
     source_plan: dict[str, Any], offline: bool, context_lines: int,
     packet_bytes: int, ca_bundle: str | None,
 ) -> dict[str, Any]:
-    """Prepare one independently scoped evidence assessment per saved file match.
+    """Build model-input packets for each dataset/file/commit match.
 
-    Reuse the existing context collection and bounded packet packaging. The
-    download cache avoids fetching shared README backgrounds repeatedly, but no
-    matching code from another file is supplied as classification evidence.
+    For Sourcegraph matches, fetch nearby source lines and README context unless
+    ``offline`` is true. For GitHub matches, use the saved ZIP excerpts without
+    making context requests. Split each file's text and product metadata into
+    JSON packets that fit ``packet_bytes``. Do not include matches from another
+    file in the same assessment. This function makes no model calls or writes.
 
     Args:
-        source_plan: Original saved-search groups and catalog metadata.
-        offline: Use saved matching lines without fetching public context.
-        context_lines: Number of surrounding lines to collect for each match.
-        packet_bytes: Maximum serialized bytes of each complete model packet.
+        source_plan: Saved file matches grouped by repository and product, with
+            catalog metadata and search-status warnings.
+        offline: Use saved Sourcegraph lines without fetching public context.
+            GitHub matches always use their previously selected ZIP excerpts.
+        context_lines: Sourcegraph surrounding lines per match. Snapshot context
+            was selected when the readable search-table row was created.
+        packet_bytes: Maximum UTF-8 bytes of a serialized evidence packet,
+            including file identity, but excluding the API request wrapper.
         ca_bundle: Optional certificate authority bundle for public downloads.
 
     Returns:
-        New file-level plan with stable source identity and preserved match rows.
-        Groups that cannot be packaged remain explicit blocked assessments.
+        Plan containing the original table rows, source-input hash, and a list
+        of packets per file. A file that cannot fit the size limit has no
+        packets and a ``preparation_error`` explaining why it is blocked.
 
     Raises:
-        SourcegraphError: If verified transport configuration is invalid.
+        SourcegraphError: If the HTTPS certificate configuration is invalid.
     """
-    if not offline:
+    snapshot_backend = source_plan.get("backend") == "github"
+    if not offline and not snapshot_backend:
         build_tls_context(ca_bundle)
     plan = {
         **copy.deepcopy({field: value for field, value in source_plan.items() if field != "groups"}),
@@ -143,7 +161,13 @@ def build_file_classification_plan(
         file_record = group["files"][0]
         print(f"[{number}/{len(plan['groups'])}] Gather {group['repository']} / {group['product']['short_name']} / "
               f"{file_record['file']} at {file_record['commit'] or 'unknown revision'}.", file=sys.stderr, flush=True)
-        enrich_evidence_group(group, download_cache, offline, context_lines, ca_bundle)
+        if snapshot_backend:
+            group["evidence"] = copy.deepcopy(group["snapshot_evidence"])
+            group["notebook_cells"] = []
+            group["notebook_decoded_lines"] = []
+            group["evidence_gaps"] = list(file_record["snapshot_warnings"])
+        else:
+            enrich_evidence_group(group, download_cache, offline, context_lines, ca_bundle)
         file_scope = {
             "assessment_unit": "file", "assessment_file": file_record["file"],
             "assessment_commit": file_record["commit"],
@@ -160,14 +184,16 @@ def build_file_classification_plan(
 
 
 def preview_file_classification_plan(plan: dict[str, Any], arguments: argparse.Namespace) -> int:
-    """Describe an unsaved file plan without credentials, output writes, or API calls.
+    """Print the file count, planned request count, and request bytes for a dry run.
 
     Args:
-        plan: In-memory plan prepared from saved matching lines only.
+        plan: In-memory plan prepared from saved matches and, for GitHub,
+            nearby lines from the downloaded ZIPs.
         arguments: Model settings and optional request limit.
 
     Returns:
-        Zero after printing the offline estimate and its context-size limitation.
+        Zero after printing the estimate. No credentials are read, files
+        written, or API requests made.
 
     Raises:
         ValueError: If the requested model or generated-token limit is invalid.
@@ -179,26 +205,31 @@ def preview_file_classification_plan(plan: dict[str, Any], arguments: argparse.N
         packet, settings["model"], settings["max_output_tokens"],
     )).encode("utf-8")) for packet in selected_packets)
     blocked_files = sum(not group["packets"] for group in plan["groups"])
+    context_note = ("Evidence uses bounded excerpts and nearby code from saved pinned snapshots; no public context is fetched. "
+                    if plan.get("backend") == "github" else
+                    "This estimate uses saved matching lines only; fetched context can change packet counts and size. ")
     print(f"Dry run: {len(plan['groups'])} file matches; {len(packets)} estimated requests; "
           f"at most {len(selected_packets)} new calls; {blocked_files} blocked files. "
           f"Estimated request JSON: {request_bytes} bytes. "
-          "This estimate uses saved matching lines only; fetched context can change packet counts and size. "
+          + context_note +
           "No files written, keys read, public context fetched, or model calls made.", file=sys.stderr)
     return 0
 
 
 def classify_file_matches(arguments: argparse.Namespace) -> int:
-    """Classify or resume saved file matches and write an annotated match table.
+    """Classify saved file matches and write ``classified-matches.csv``.
 
-    A new output is prepared automatically. Existing file-level outputs reuse
-    their frozen context and successful receipts only when the saved search and
-    catalog still match. Repository-level runs are never reinterpreted as file
-    judgments. With no request cap, all eligible requests are selected; failed
-    or uncertain requests still require explicit retry authorization.
+    A new output directory gets a plan containing source excerpts, product
+    descriptions, and model-input packets. An existing file-level run reuses
+    that plan and its successful model responses only if the source search and
+    catalog are unchanged. Repository-level output cannot be resumed here.
+    Without a request cap, all pending packets may incur paid requests; failed
+    or uncertain requests require the retry flag. A dry run prints a preview
+    without making model requests or writing output.
 
     Args:
         arguments: Saved batch/catalog paths, output directory, model/credential
-            options, context bounds, optional request cap, and dry-run/retry flags.
+            options, context/packet size limits, request cap, and dry-run/retry flags.
 
     Returns:
         Zero for completed processing or a dry run, four for unfinished/blocked
@@ -206,8 +237,8 @@ def classify_file_matches(arguments: argparse.Namespace) -> int:
 
     Raises:
         OSError: If source files or output cannot be accessed.
-        ValueError: If bounds, sources, or resumed output are incompatible.
-        SourcegraphError: If verified transport configuration is invalid.
+        ValueError: If limits, source data, or resumed output are incompatible.
+        SourcegraphError: If the HTTPS certificate configuration is invalid.
     """
     if arguments.packet_bytes < 4096 or not 0 <= arguments.context_lines <= 100:
         raise ValueError("--packet-bytes must be at least 4096; --context-lines must be 0 through 100.")
@@ -215,8 +246,12 @@ def classify_file_matches(arguments: argparse.Namespace) -> int:
         raise ValueError("--max-requests must be positive when supplied.")
     batch_directory = arguments.batch_directory.resolve()
     output_directory = arguments.output.resolve()
-    catalog_directory = resolve_file_classification_catalog(batch_directory, arguments.catalog)
-    source_plan = read_product_evidence_groups(batch_directory, catalog_directory)
+    source_backend = read_evidence_json(batch_directory / "plan.json").get("backend")
+    if source_backend == "github":
+        source_plan = read_snapshot_evidence_groups(batch_directory, arguments.catalog)
+    else:
+        catalog_directory = resolve_file_classification_catalog(batch_directory, arguments.catalog)
+        source_plan = read_product_evidence_groups(batch_directory, catalog_directory)
     if read_evidence_json(batch_directory / "summary.json") != source_plan["source_batch_summary"]:
         raise ValueError("The saved search changed while reading it; finish or stop the search before classification.")
     if output_directory.exists():
