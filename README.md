@@ -306,6 +306,10 @@ includes introductory text when it fits. Added notebook context excludes stored
 outputs and metadata, retains cell locations, and stops at section boundaries.
 Original matching excerpts remain available even when a notebook cannot be decoded.
 
+For Markdown and R Markdown, classification includes relevant section headings
+and bounded introductory text so worked examples retain their stated purpose.
+Headings inside code blocks are not treated as document headings.
+
 Added code stays in the same file and revision, has source citations, and uses
 at most 6,000 additional characters within the combined 12,000-character limit.
 Other files fall back to bounded nearby context. Warnings identify omitted text;
@@ -357,8 +361,10 @@ original dataset associations and display a notice when resumed. No additional
 repository download is needed to prepare the new evidence. New model requests
 can incur charges; use `--dry-run` to inspect the count first.
 
-Failures or uncertain requests require `--retry-failed`; an interrupted request
-may already have incurred a charge.
+Resume revalidates saved responses. A previously rejected response that now
+passes validation is reused without another model call. Use `--retry-failed`
+to resubmit remaining failed or uncertain requests; an interrupted request may
+already have incurred a charge.
 
 Options include `--context-lines 20` (default 10 for fetched Sourcegraph context),
 `--packet-bytes 48000` (default 24000), and `--max-output-tokens 8192` (default

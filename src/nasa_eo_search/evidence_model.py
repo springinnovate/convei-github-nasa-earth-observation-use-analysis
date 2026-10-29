@@ -250,6 +250,45 @@ def version_occurs_in_product_constants(version: str, evidence_text: str, produc
     return re.search(constant_pattern, evidence_text, re.MULTILINE) is not None
 
 
+def version_occurs_in_named_product_artifact(version: str, evidence_text: str, product_name: str) -> bool:
+    """Recognize source versions in bounded catalog filenames and virtual-store URLs.
+
+    Catalog filenames can put the MODIS collection version before the exact
+    product identifier. A virtual-store URL can append its own representation
+    version after a product name that already ends with an explicit ``v`` version.
+    These names establish only a visible product/version association, not the
+    artifact's contents or compatibility. Arbitrary derived-product suffixes do
+    not qualify.
+
+    Args:
+        version: Exact version token reported by the model.
+        evidence_text: Cited source text containing the filename or storage URL.
+        product_name: Complete NASA product short name being assessed.
+
+    Returns:
+        Whether a recognized artifact name explicitly contains the product version.
+    """
+    if re.fullmatch(r"[0-9]{3}", version):
+        catalog_filename = (
+            r"(?<![A-Za-z0-9_.-])MODIS_" + re.escape(version) + "_" + re.escape(product_name)
+            + r"\.(?:libsonnet|jsonnet|json|js)(?![A-Za-z0-9_.-])"
+        )
+        if re.search(catalog_filename, evidence_text, re.IGNORECASE):
+            return True
+    numeric_version = version[1:] if re.fullmatch(r"v[0-9]+(?:\.[0-9]+)*", version, re.IGNORECASE) else version
+    if (not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", numeric_version)
+            or not re.search(r"[-_.]v" + re.escape(numeric_version) + r"$", product_name, re.IGNORECASE)):
+        return False
+    # Require a complete path segment and a named virtual representation. A
+    # representation's v2/p2 suffix must never become the observed data version.
+    virtual_store_url = (
+        r"(?<![A-Za-z0-9_+.-])(?:s3|gs|az|https?)://[^/\s\"'<>?#]+/"
+        + r"(?:[^/\s\"'<>?#]+/)*" + re.escape(product_name)
+        + r"-virtual-v[0-9]+(?:-p[0-9]+)?(?=[/\s\"'<>?#)]|$)"
+    )
+    return re.search(virtual_store_url, evidence_text, re.IGNORECASE) is not None
+
+
 def version_occurs_with_product(version: str, evidence_text: str, product_name: str) -> bool:
     """Check for a bounded version token near an explicit product identifier.
 
@@ -260,8 +299,9 @@ def version_occurs_with_product(version: str, evidence_text: str, product_name: 
     collection IDs, explicit ``product/versions/number`` URLs, ``V06 (product)``
     and ``(product) Version 6.1`` titles, terminal product-name markers, adjacent
     catalog title/version fields, consecutive same-prefix product/version
-    constants, and named CSV columns. SMAP paths require the complete short name
-    so the enhanced product cannot supply a base-product version.
+    constants, named CSV columns, MODIS catalog filenames, and explicit product
+    versions inside named virtual-store URLs. SMAP paths require the complete
+    short name so the enhanced product cannot supply a base-product version.
 
     Args:
         version: Exact version token reported by the model.
@@ -276,6 +316,8 @@ def version_occurs_with_product(version: str, evidence_text: str, product_name: 
     if version_occurs_in_product_csv(version, evidence_text, product_name):
         return True
     if version_occurs_in_product_constants(version, evidence_text, product_name):
+        return True
+    if version_occurs_in_named_product_artifact(version, evidence_text, product_name):
         return True
     if re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
         product_version_url = (r"(?<![A-Za-z0-9_.-])" + re.escape(product_name)
