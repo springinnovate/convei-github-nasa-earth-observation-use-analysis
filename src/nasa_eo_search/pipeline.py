@@ -196,6 +196,8 @@ def main(argument_values: list[str] | None = None) -> int:
     classify = commands.add_parser("classify", help="classify saved matching files; automatically gather context and resume")
     classify.add_argument("batch_directory", type=Path, help="saved search output directory")
     classify.add_argument("--catalog", type=Path, help="source catalog if it has moved; otherwise use its saved location")
+    classify.add_argument("--short-name", action="append", help="classify only this exact dataset; repeat for several; omit selectors on resume to reuse the saved selection")
+    classify.add_argument("--selection", type=Path, help="CSV of match_id values copied from matches.csv; combines with --short-name; other columns are ignored")
     classify.add_argument("--model", required=True, help="GPT model supporting Responses structured outputs")
     classify.add_argument("--api-key-file", type=Path, help="key file; default lookup includes ./secrets/openai.key")
     classify.add_argument("--offline", action="store_true", help="use saved evidence without public-code downloads; GPT calls still occur")

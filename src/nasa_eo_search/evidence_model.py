@@ -167,6 +167,34 @@ def version_occurs_in_product_csv(version: str, evidence_text: str, product_name
         return False
 
 
+def version_occurs_in_product_constants(version: str, evidence_text: str, product_name: str) -> bool:
+    """Check consecutive literal product/version constants with the same prefix.
+
+    Accept assignments such as ``IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"`` followed
+    immediately by ``IMERG_VERSION = "07"`` at the same indentation. Optional
+    ``str`` annotations and trailing comments are allowed. The exact product
+    and version must be quoted literals; no source code is executed.
+
+    Args:
+        version: Complete observed version text to find in the second assignment.
+        evidence_text: Cited source text containing both consecutive assignments.
+        product_name: Exact product short name to find in the first assignment.
+
+    Returns:
+        True only when the adjacent constants explicitly associate these values.
+    """
+    assignment = r"[ \t]*(?::[ \t]*str)?[ \t]*=[ \t]*"
+    constant_pattern = (
+        r"^(?P<indent>[ \t]*)(?P<prefix>[A-Za-z_][A-Za-z0-9_]*)_PRODUCT(?:_[A-Za-z0-9_]+)?"
+        + assignment + r"(?P<product_quote>['\"])" + re.escape(product_name) + r"(?P=product_quote)"
+        + r"[ \t]*(?:#[^\r\n]*)?\r?\n"
+        + r"(?P=indent)(?P=prefix)_VERSION"
+        + assignment + r"(?P<version_quote>['\"])" + re.escape(version) + r"(?P=version_quote)"
+        + r"[ \t]*(?:#[^\r\n]*)?\r?$"
+    )
+    return re.search(constant_pattern, evidence_text, re.MULTILINE) is not None
+
+
 def version_occurs_with_product(version: str, evidence_text: str, product_name: str) -> bool:
     """Check for a bounded version token near an explicit product identifier.
 
@@ -175,9 +203,10 @@ def version_occurs_with_product(version: str, evidence_text: str, product_name: 
     Require a filename/URL-style product token or an explicit version marker.
     This includes ``MODIS/version/product`` and ``NASA/SMAP/product/version``
     collection IDs, explicit ``product/versions/number`` URLs, ``V06 (product)``
-    titles, terminal product-name markers, adjacent catalog title/version fields,
-    and named CSV columns. SMAP paths require the complete short name so the
-    enhanced product cannot supply a base-product version.
+    and ``(product) Version 6.1`` titles, terminal product-name markers, adjacent
+    catalog title/version fields, consecutive same-prefix product/version
+    constants, and named CSV columns. SMAP paths require the complete short name
+    so the enhanced product cannot supply a base-product version.
 
     Args:
         version: Exact version token reported by the model.
@@ -190,6 +219,8 @@ def version_occurs_with_product(version: str, evidence_text: str, product_name: 
     if not product_name:
         return False
     if version_occurs_in_product_csv(version, evidence_text, product_name):
+        return True
+    if version_occurs_in_product_constants(version, evidence_text, product_name):
         return True
     if re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
         product_version_url = (r"(?<![A-Za-z0-9_.-])" + re.escape(product_name)
@@ -229,6 +260,12 @@ def version_occurs_with_product(version: str, evidence_text: str, product_name: 
         title_pattern = (r"(?<![A-Za-z0-9])" + marked_version
                          + r"[ \t]+\([ \t]*" + re.escape(product_name) + r"[ \t]*\)")
         if re.search(title_pattern, evidence_text, re.IGNORECASE):
+            return True
+        parenthesized_product_version = (
+            r"\([ \t]*" + re.escape(product_name) + r"[ \t]*\)[ \t]+"
+            + marked_version + r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
+        )
+        if re.search(parenthesized_product_version, evidence_text, re.IGNORECASE):
             return True
     for product_match in product_pattern.finditer(evidence_text):
         nearby_text = evidence_text[max(0, product_match.start() - 120):product_match.end() + 200]

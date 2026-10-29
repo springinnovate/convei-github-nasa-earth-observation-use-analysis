@@ -19,19 +19,24 @@ from test_evidence_classify import make_model_response
 from test_evidence_reports_v2 import create_packet_judgment, create_report_plan
 
 
-def create_modis_version_plan() -> dict:
-    """Build one auditable file excerpt containing an older Earth Engine version.
+def create_modis_version_plan(
+    source_text: str = 'collection = ee.ImageCollection("MODIS/006/MOD13Q1")',
+) -> dict:
+    """Build one auditable MODIS excerpt with explicit product/version evidence.
+
+    Args:
+        source_text: Cited source containing the MODIS identifier and version.
 
     Returns:
-        Repository-level test plan with MODIS collection 006 in code and 061
-        only in catalog metadata. No credentials or external files are accessed.
+        Repository-level test plan with the supplied source and catalog version
+        061. No credentials or external files are accessed.
     """
     plan = create_report_plan(packet_count=1)
     group = plan["groups"][0]
     group["product"] = {"provider": "LPCLOUD", "short_name": "MOD13Q1", "catalog_versions": ["061"]}
     group["group_id"] = identify_evidence([group["repository"], "LPCLOUD", "MOD13Q1"])
     raw_evidence = group["evidence"][0]
-    raw_evidence["text"] = 'collection = ee.ImageCollection("MODIS/006/MOD13Q1")'
+    raw_evidence["text"] = source_text
     raw_evidence.pop("evidence_id")
     raw_evidence["evidence_id"] = identify_evidence(raw_evidence)
     block = group["evidence_blocks"][0]
@@ -118,6 +123,91 @@ class DatasetVersionValidationTests(unittest.TestCase):
         for version, source_text in rejected_sources:
             with self.subTest(version=version, source_text=source_text):
                 self.assertFalse(version_occurs_with_product(version, source_text, "GPM_3IMERGDF"))
+
+    def test_explicit_version_after_parenthesized_product_is_accepted(self) -> None:
+        """Accept exact versions immediately following a parenthesized dataset name."""
+        accepted_sources = (
+            ("6.1", "MODIS Vegetation Indices (MOD13Q1) Version 6.1"),
+            ("6.1", "MODIS Vegetation Indices (MOD13Q1) Version6.1"),
+            ("6.1", "( mod13q1 )\tver. 6.1"),
+            ("6.1", "(MOD13Q1) v6.1."),
+            ("v6.1", "(MOD13Q1) v6.1"),
+        )
+        for version, source_text in accepted_sources:
+            with self.subTest(version=version, source_text=source_text):
+                self.assertTrue(version_occurs_with_product(version, source_text, "MOD13Q1"))
+                packet = create_modis_version_plan(source_text)["groups"][0]["packets"][0]
+                judgment = create_packet_judgment()
+                judgment["observed_versions"] = [{"version": version, "evidence_ids": ["E1"]}]
+                self.assertEqual(validate_classification(judgment, packet)["observed_versions"],
+                                 judgment["observed_versions"])
+
+    def test_versions_after_parenthesized_products_require_exact_association(self) -> None:
+        """Reject sibling identifiers, nearby software versions, and partial tokens."""
+        rejected_sources = (
+            "(OTHER_MOD13Q1) Version 6.1",
+            "(MYMOD13Q1) Version 6.1",
+            "(MOD13Q1_E) Version 6.1",
+            "(MOD13Q1-derived) Version 6.1",
+            "(MOD13Q10) Version 6.1",
+            "(MOD13Q1) supports helper Version 6.1",
+            "(MOD13Q1)\nSoftware Version 6.1",
+            "(MOD13Q1) 6.1",
+            "(MOD13Q1) sample count: 6.1",
+            "(MOD13Q1) Version 6.10",
+            "(MOD13Q1) Version 6.1.2",
+            "(MOD13Q1) Version 6.1beta",
+            "(MOD13Q1) Version 6.1_RC1",
+            "(MOD13Q1) Version 6.1-beta",
+            "(MOD13Q1) Version 6.1.extra",
+            "MOD13Q1 is separate; (OTHER_MOD13Q1) Version 6.1",
+        )
+        for source_text in rejected_sources:
+            with self.subTest(source_text=source_text):
+                self.assertFalse(version_occurs_with_product("6.1", source_text, "MOD13Q1"))
+        self.assertFalse(version_occurs_with_product("6", "(MOD13Q1) Version 6.1", "MOD13Q1"))
+
+    def test_adjacent_product_and_version_constants_associate_quoted_values(self) -> None:
+        """Accept exact product/version literals in consecutive same-prefix constants."""
+        accepted_sources = (
+            'IMERG_PRODUCT_DAILY: str = "GPM_3IMERGDF"\nIMERG_VERSION: str = "07"',
+            "IMERG_PRODUCT = 'GPM_3IMERGDF'\nIMERG_VERSION = '07'\n",
+            '    IMERG_PRODUCT_DAILY: str = "GPM_3IMERGDF"  # daily product\r\n'
+            '    IMERG_VERSION = "07"  # dataset version\r\n',
+        )
+        for source_text in accepted_sources:
+            with self.subTest(source_text=source_text):
+                self.assertTrue(version_occurs_with_product("07", source_text, "GPM_3IMERGDF"))
+                packet = create_modis_version_plan()["groups"][0]["packets"][0]
+                packet["product"]["short_name"] = "GPM_3IMERGDF"
+                packet["evidence"][0]["text"] = source_text
+                judgment = create_packet_judgment()
+                judgment["observed_versions"] = [{"version": "07", "evidence_ids": ["E1"]}]
+                self.assertEqual(validate_classification(judgment, packet)["observed_versions"],
+                                 judgment["observed_versions"])
+
+    def test_product_version_constants_reject_unlinked_or_nonliteral_values(self) -> None:
+        """Reject other prefixes, products, expressions, separated lines and partial values."""
+        rejected_sources = (
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\nOTHER_VERSION = "07"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\nimerg_VERSION = "07"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF_E"\nIMERG_VERSION = "07"',
+            'IMERG_PRODUCT_DAILY = "OTHER_GPM_3IMERGDF"\nIMERG_VERSION = "07"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\nIMERG_VERSION = "071"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\nIMERG_VERSION = "07.1"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\nIMERG_VERSION_EXTRA = "07"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\n\nIMERG_VERSION = "07"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\n# another setting\nIMERG_VERSION = "07"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\nOTHER = True\nIMERG_VERSION = "07"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\n    IMERG_VERSION = "07"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF" + suffix\nIMERG_VERSION = "07"',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\nIMERG_VERSION = "07" + suffix',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\nIMERG_VERSION = get_version("07")',
+            'IMERG_PRODUCT_DAILY = "GPM_3IMERGDF"\nIMERG_VERSION = 7',
+        )
+        for source_text in rejected_sources:
+            with self.subTest(source_text=source_text):
+                self.assertFalse(version_occurs_with_product("07", source_text, "GPM_3IMERGDF"))
 
     def test_terminal_version_in_exact_product_name_is_accepted(self) -> None:
         """Recognize 4.1 and v4.1 in the complete MUR product identifier."""
@@ -298,10 +388,27 @@ class DatasetVersionValidationTests(unittest.TestCase):
                 self.assertFalse(version_occurs_with_product("003", source_text, "SRTMGL1"))
 
     def test_failed_version_validation_reuses_durable_response_without_new_call(self) -> None:
-        """Recover a paid response rejected by the old path check without retrying."""
-        with TemporaryDirectory() as temporary_directory:
+        """Recover rejected paths, titles and paired constants without another call."""
+        source_cases = (
+            ("006", 'collection = ee.ImageCollection("MODIS/006/MOD13Q1")'),
+            ("6.1", "MODIS Vegetation Indices (MOD13Q1) Version 6.1"),
+            ("07", 'MODIS_PRODUCT_DAILY: str = "MOD13Q1"\nMODIS_VERSION: str = "07"'),
+        )
+        for observed_version, source_text in source_cases:
+            with self.subTest(source_text=source_text), TemporaryDirectory() as temporary_directory:
+                self.assert_cached_version_response_recovers(Path(temporary_directory), observed_version, source_text)
+
+    def assert_cached_version_response_recovers(self, temporary_directory: Path, observed_version: str, source_text: str) -> None:
+        """Verify a rejected response is revalidated locally and retained unchanged.
+
+        Args:
+            temporary_directory: Test-owned root for the classification run.
+            observed_version: Exact version stored in the old failed response.
+            source_text: Cited product/version evidence supplied to that response.
+        """
+        with redirect_stderr(StringIO()):
             output_directory = Path(temporary_directory) / "classification"
-            plan = create_modis_version_plan()
+            plan = create_modis_version_plan(source_text)
             with redirect_stderr(StringIO()):
                 save_prepared_classification_plan(output_directory, plan)
             packet = plan["groups"][0]["packets"][0]
@@ -309,7 +416,7 @@ class DatasetVersionValidationTests(unittest.TestCase):
             request_id = identify_evidence(request_body)
             response = make_model_response(request_body)
             judgment = json.loads(response["output"][0]["content"][0]["text"])
-            judgment["observed_versions"] = [{"version": "006", "evidence_ids": ["E1"]}]
+            judgment["observed_versions"] = [{"version": observed_version, "evidence_ids": ["E1"]}]
             response["output"][0]["content"][0]["text"] = json.dumps(judgment)
             receipt_directory = output_directory / "requests" / request_id
             receipt_directory.mkdir(parents=True)

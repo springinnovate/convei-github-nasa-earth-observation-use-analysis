@@ -255,8 +255,35 @@ query does not establish that every public repository was searched.
 
 ## 3. Classify saved files
 
-Input is a saved search **directory**, not a CSV. GitHub snapshot searches and
-existing Sourcegraph searches use the same classification command/categories.
+Input is a saved search **directory**. GitHub snapshot searches and existing
+Sourcegraph searches use the same classification command/categories.
+
+To classify only particular datasets, repeat `--short-name` with their exact,
+case-sensitive names:
+
+```sh
+nasa-eo classify github-pilot --short-name ATL03 --short-name ATL06 --model YOUR_MODEL --max-requests 3 --output selected-classifications --dry-run
+```
+
+To choose individual matches, copy `github-pilot/matches.csv` to
+`selected-matches.csv` and keep only the rows you want. Preserve the `match_id`
+column and its values; other columns may remain and are ignored when selecting.
+The saved search supplies the actual code evidence, even if you edit the copy.
+
+```sh
+nasa-eo classify github-pilot --selection selected-matches.csv --model YOUR_MODEL --max-requests 3 --output chosen-classifications --dry-run
+```
+
+Replace `YOUR_MODEL`, inspect the preview, then remove `--dry-run` to classify.
+Without either selector, a new run includes all saved matches. If both selectors
+are supplied, a match must be in the CSV and belong to a named dataset.
+Unknown names or IDs, empty selections, and selections with no matching files
+fail before model calls. Duplicate names or IDs select the same match once.
+
+The output saves the selection. To resume, repeat the same selectors or omit
+both; the original selection CSV is not needed when both are omitted. Use a new
+`--output` directory for a different selection. `--max-requests` limits new model
+calls; it does not choose a varied sample or change the saved selection.
 
 GitHub classification uses bounded matching and enclosing code from the saved,
 verified revision, without re-downloading public context. Sourcegraph
