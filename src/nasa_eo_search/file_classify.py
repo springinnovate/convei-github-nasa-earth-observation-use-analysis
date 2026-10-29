@@ -15,6 +15,7 @@ from nasa_eo_search.evidence_context import build_evidence_packets, enrich_evide
 from nasa_eo_search.evidence_inputs import identify_evidence, read_evidence_json, read_product_evidence_groups, serialize_evidence
 from nasa_eo_search.evidence_model import CLASSIFICATION_PROMPT, PROMPT_VERSION, build_classification_request
 from nasa_eo_search.evidence_reports import load_evidence_plan, save_evidence_json, write_evidence_reports
+from nasa_eo_search.file_selection import identify_saved_file_match, select_file_classification_matches
 from nasa_eo_search.pipeline_tables import build_file_match_row
 from nasa_eo_search.sourcegraph import build_tls_context
 from nasa_eo_search.snapshot_evidence import CATALOG_IDENTITY_POLICY, read_snapshot_evidence_groups
@@ -44,7 +45,9 @@ def resolve_file_classification_catalog(batch_directory: Path, catalog_directory
     return Path(saved_catalog).resolve()
 
 
-def split_repository_groups_into_files(source_plan: dict[str, Any]) -> list[dict[str, Any]]:
+def split_repository_groups_into_files(
+    source_plan: dict[str, Any], selected_match_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     """Split repository/product groups into one group per matching file and commit.
 
     Copy each original search-table row so the classification CSV can retain it.
@@ -55,6 +58,7 @@ def split_repository_groups_into_files(source_plan: dict[str, Any]) -> list[dict
     Args:
         source_plan: Saved-search data containing repository/product groups,
             each with a ``files`` list and search-status warnings.
+        selected_match_ids: IDs to copy, or None to copy all saved file matches.
 
     Returns:
         Independent groups, each containing exactly one matched file and revision.
@@ -67,6 +71,9 @@ def split_repository_groups_into_files(source_plan: dict[str, Any]) -> list[dict
     }
     for repository_group in source_plan["groups"]:
         for file_record in repository_group["files"]:
+            if (selected_match_ids is not None
+                    and identify_saved_file_match(repository_group, file_record) not in selected_match_ids):
+                continue
             snapshot_backend = source_plan.get("backend") == "github"
             match_row = (copy.deepcopy(file_record["snapshot_match_row"]) if snapshot_backend
                          else build_file_match_row(repository_group, file_record))
@@ -123,7 +130,7 @@ def identify_file_classification_source(source_plan: dict[str, Any]) -> str:
 
 def build_file_classification_plan(
     source_plan: dict[str, Any], offline: bool, context_lines: int,
-    packet_bytes: int, ca_bundle: str | None,
+    packet_bytes: int, ca_bundle: str | None, file_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build model-input packets for each dataset/file/commit match.
 
@@ -144,6 +151,8 @@ def build_file_classification_plan(
         packet_bytes: Maximum UTF-8 bytes of a serialized evidence packet,
             including file identity, but excluding the API request wrapper.
         ca_bundle: Optional certificate authority bundle for public downloads.
+        file_selection: Validated saved-match selection, or None to prepare all
+            matches. The source hash still covers the complete saved search.
 
     Returns:
         Plan containing the original table rows, source-input hash, and a list
@@ -158,11 +167,15 @@ def build_file_classification_plan(
         build_tls_context(ca_bundle)
     plan = {
         **copy.deepcopy({field: value for field, value in source_plan.items() if field != "groups"}),
-        "groups": split_repository_groups_into_files(source_plan),
+        "groups": split_repository_groups_into_files(
+            source_plan, set(file_selection["selected_match_ids"]) if file_selection is not None else None,
+        ),
         "assessment_unit": "file", "source_evidence_id": identify_file_classification_source(source_plan),
         "prompt_version": PROMPT_VERSION, "created_at": datetime.now(timezone.utc).isoformat(),
         "offline": offline, "context_lines": context_lines, "packet_bytes": packet_bytes,
     }
+    if file_selection is not None:
+        plan["file_selection"] = copy.deepcopy(file_selection)
     download_cache: dict[str, Any] = {}
     snapshot_repository = None
     snapshot_sources: dict[str, list[str]] = {}
@@ -226,7 +239,8 @@ def preview_file_classification_plan(plan: dict[str, Any], arguments: argparse.N
     context_note = ("Evidence uses bounded excerpts and nearby code from saved pinned snapshots; no public context is fetched. "
                     if plan.get("backend") == "github" else
                     "This estimate uses saved matching lines only; fetched context can change packet counts and size. ")
-    print(f"Dry run: {len(plan['groups'])} file matches; {len(packets)} estimated requests; "
+    available_matches = plan.get("file_selection", {}).get("available_matches", len(plan["groups"]))
+    print(f"Dry run: {len(plan['groups'])} file matches selected from {available_matches} available; {len(packets)} estimated requests; "
           f"at most {len(selected_packets)} new calls; {blocked_files} blocked files. "
           f"Estimated request JSON: {request_bytes} bytes. "
           + context_note +
@@ -241,13 +255,16 @@ def classify_file_matches(arguments: argparse.Namespace) -> int:
     descriptions, and model-input packets. An existing file-level run reuses
     that plan and its successful model responses only if the source search and
     catalog are unchanged. Repository-level output cannot be resumed here.
+    Optional exact dataset names and a CSV of match IDs select files before
+    gathering context. Omit both selectors on resume to reuse the frozen choice.
     Without a request cap, all pending packets may incur paid requests; failed
     or uncertain requests require the retry flag. A dry run prints a preview
     without making model requests or writing output.
 
     Args:
         arguments: Saved batch/catalog paths, output directory, model/credential
-            options, context/packet size limits, request cap, and dry-run/retry flags.
+            options, dataset/CSV selection, context/packet size limits, request
+            cap, and dry-run/retry flags.
 
     Returns:
         Zero for completed processing or a dry run, four for unfinished/blocked
@@ -287,12 +304,18 @@ def classify_file_matches(arguments: argparse.Namespace) -> int:
             raise ValueError("This output contains repository-level assessments. Choose a new output directory for file classification.")
         if plan.get("source_evidence_id") != identify_file_classification_source(source_plan):
             raise ValueError("Saved search or catalog differs from this file-classification run. Choose a new output directory.")
+    file_selection = select_file_classification_matches(
+        source_plan, getattr(arguments, "short_name", None), getattr(arguments, "selection", None), saved_plan,
+    )
+    print(f"Selected {file_selection['selected_matches']} of {file_selection['available_matches']} saved file matches.",
+          file=sys.stderr, flush=True)
+    if saved_plan is not None:
         print("Reusing frozen file evidence; context preparation options apply only to a new output directory.", file=sys.stderr)
     else:
         select_classification_settings(output_directory, arguments.model, arguments.max_output_tokens)
         plan = build_file_classification_plan(
             source_plan, arguments.offline or arguments.dry_run, arguments.context_lines,
-            arguments.packet_bytes, arguments.ca_bundle,
+            arguments.packet_bytes, arguments.ca_bundle, file_selection,
         )
         if arguments.dry_run:
             return preview_file_classification_plan(plan, arguments)
