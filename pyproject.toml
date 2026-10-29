@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nasa-eo-sourcegraph-search"
 version = "0.1.0"
-description = "Trace one query through Sourcegraph's streaming search API"
+description = "Collect NASA datasets, search public code, and classify matching files"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -17,6 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
+nasa-eo = "nasa_eo_search.pipeline:main"
 sourcegraph-search = "nasa_eo_search.sourcegraph:main"
 nasa-product-preview = "nasa_eo_search.cmr:main"
 nasa-catalog-collect = "nasa_eo_search.catalog:main"
