@@ -1,10 +1,10 @@
 """Build compact, lossless matched-code packets with a separate provenance audit."""
 
 from collections import defaultdict
-import re
 from typing import Any
 from urllib.parse import quote
 
+from nasa_eo_search.dataset_identity import find_product_identifier_occurrences
 from nasa_eo_search.evidence_inputs import serialize_evidence
 from nasa_eo_search.evidence_notebooks import decode_saved_notebook_line
 
@@ -13,21 +13,23 @@ MAXIMUM_IDENTIFIER_TERMS = 32
 MAXIMUM_SOURCES_PER_IDENTIFIER = 8
 
 
-def find_identifier_occurrences(term: str, text: str) -> list[tuple[int, int]]:
+def find_identifier_occurrences(
+    term: str, text: str, identity_rules: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[tuple[int, int]]:
     """Locate complete catalog identifiers using the searcher's token boundaries.
 
     Args:
         term: Literal catalog identifier, rather than a regular expression.
         text: Saved source text to inspect without changing its characters.
+        identity_rules: Known longer catalog identifiers and whether they belong
+            to this product. Omit for archived evidence using broad boundaries.
 
     Returns:
         Character ranges for case-insensitive matches with no adjacent ASCII
-        letter or digit. Underscores separate identifiers, as in dataset filenames.
+        letter or digit. Occurrences inside a longer identifier owned exclusively
+        by another product are excluded when identity rules are supplied.
     """
-    return [(match.start(), match.end()) for match in re.finditer(
-        r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])", text,
-        flags=re.IGNORECASE | re.ASCII,
-    )] if term else []
+    return find_product_identifier_occurrences(term, text, identity_rules)
 
 
 def collect_matched_identifier_mappings(group: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -55,7 +57,18 @@ def collect_matched_identifier_mappings(group: dict[str, Any]) -> tuple[list[dic
     sources_by_term: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = defaultdict(dict)
     for signature in product.get("candidate_signatures", []):
         term = signature.get("term", "")
-        if not term or not any(find_identifier_occurrences(term, line["text"]) for line in matching_lines):
+        valid_occurrences = group.get("identifier_valid_occurrences")
+        accepted_positions = ({(item["line_number"], item["character_offset"], item["end_offset"])
+                               for item in valid_occurrences.get(term, [])}
+                              if valid_occurrences is not None else None)
+        if not term or not any(
+            accepted_positions is None or (
+                line["line_number"], line["character_offset"] + start, line["character_offset"] + end,
+            ) in accepted_positions
+            for line in matching_lines for start, end in find_identifier_occurrences(
+                term, line["text"], group.get("identifier_identity_rules"),
+            )
+        ):
             continue
         for source in signature.get("sources", []):
             concept_id = source.get("concept_id")
@@ -89,11 +102,15 @@ def collect_matched_identifier_mappings(group: dict[str, Any]) -> tuple[list[dic
     return mappings, omitted_sources
 
 
-def filter_packet_identifier_mappings(packet: dict[str, Any]) -> dict[str, Any]:
+def filter_packet_identifier_mappings(
+    packet: dict[str, Any], valid_terms_by_evidence: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
     """Keep catalog mappings only for complete identifiers in this packet's code.
 
     Args:
         packet: Finished packet whose shared metadata may describe other packets.
+        valid_terms_by_evidence: Internal allowlist derived from original source
+            positions for identity-filtered snapshots. Omit for legacy packets.
 
     Returns:
         A new packet with product metadata filtered to identifiers actually
@@ -103,12 +120,55 @@ def filter_packet_identifier_mappings(packet: dict[str, Any]) -> dict[str, Any]:
     if "matched_identifiers" not in product:
         return packet
     mappings = [mapping for mapping in product["matched_identifiers"]
-                if any(find_identifier_occurrences(mapping["term"], block["text"])
+                if any((valid_terms_by_evidence is None
+                        or mapping["term"] in valid_terms_by_evidence.get(block["evidence_id"], set()))
+                       and find_identifier_occurrences(
+                    mapping["term"], block["text"], product.get("identifier_identity_rules"),
+                )
                        for block in packet["evidence"])]
     included_terms = {mapping["term"] for mapping in mappings}
     return {**packet, "product": {**product, "matched_identifiers": mappings,
             "identifier_sources_omitted": {term: count for term, count in product["identifier_sources_omitted"].items()
                                            if term in included_terms}}}
+
+
+def find_validated_block_identifier_terms(
+    block: dict[str, Any], valid_occurrences: dict[str, list[dict[str, int]]],
+) -> set[str]:
+    """Find identifiers whose fragment positions trace to accepted source hits.
+
+    Call while packaging identity-filtered snapshot evidence. Audit line maps
+    retain original Unicode character offsets, even after a block is split.
+    A clipped context prefix cannot establish a mapping merely because its text
+    resembles a complete product name. These position records stay out of GPT
+    packets. Decoded notebook text has a different coordinate system, so raw
+    source positions alone do not establish mappings in those transformed blocks.
+
+    Args:
+        block: Audit evidence block or fragment with source_line_map locations.
+        valid_occurrences: Accepted original line/character ranges per term in
+            this file, established against the full saved source before clipping.
+
+    Returns:
+        Terms with at least one complete occurrence traceable to accepted source.
+    """
+    if block.get("representation", "source_lines") != "source_lines":
+        return set()
+    accepted_terms = set()
+    fragment_offset = block.get("text_offset", 0)
+    for term, occurrences in valid_occurrences.items():
+        accepted_positions = {(item["line_number"], item["character_offset"], item["end_offset"])
+                              for item in occurrences}
+        for start, end in find_identifier_occurrences(term, block["text"]):
+            original_start, original_end = fragment_offset + start, fragment_offset + end
+            for location in block.get("locations", []):
+                for source_line in location.get("source_line_map", []):
+                    if source_line["text_start"] <= original_start < original_end <= source_line["text_end"]:
+                        source_start = source_line["character_offset"] + original_start - source_line["text_start"]
+                        source_end = source_line["character_offset"] + original_end - source_line["text_start"]
+                        if (source_line["line_number"], source_start, source_end) in accepted_positions:
+                            accepted_terms.add(term)
+    return accepted_terms
 
 
 def separate_conflicting_line_fragments(
@@ -317,7 +377,7 @@ def compact_product_description(group: dict[str, Any]) -> dict[str, Any]:
     if len(title) > 300 or len(description) > 1000:
         group["packaging_notes"].append("Model product title/description is limited to 300/1000 characters; complete metadata remains in the audit.")
     matched_identifiers, omitted_sources = collect_matched_identifier_mappings(group)
-    return {
+    product_description = {
         "provider": product["provider"], "short_name": product["short_name"],
         "title": title[:300], "description": description[:1000],
         "description_truncated": len(title) > 300 or len(description) > 1000,
@@ -331,6 +391,13 @@ def compact_product_description(group: dict[str, Any]) -> dict[str, Any]:
             "cite code evidence for the classification. Up to eight collection sources per identifier are shown."
         ),
     }
+    if group.get("identifier_identity_rules"):
+        product_description["identifier_identity_rules"] = group["identifier_identity_rules"]
+        product_description["identifier_relationship_note"] += (
+            " Longer identifiers marked same_product=false belong to distinct catalog datasets; "
+            "their embedded shorter names do not establish this product's identity."
+        )
+    return product_description
 
 
 def build_repository_context(group: dict[str, Any], maximum_characters: int = 1000) -> list[dict[str, Any]]:
@@ -453,8 +520,13 @@ def split_evidence_block(
     """
     if measure_packet_bytes({**metadata, "evidence": [compact_evidence_block(block)]}) <= maximum_bytes:
         return [block]
-    identifier_ranges = sorted({occurrence for mapping in metadata["product"].get("matched_identifiers", [])
-                                for occurrence in find_identifier_occurrences(mapping["term"], block["text"])})
+    product = metadata["product"]
+    protected_identifiers = {mapping["term"] for mapping in product.get("matched_identifiers", [])}
+    protected_identifiers.update(
+        rule["term"] for rules in product.get("identifier_identity_rules", {}).values() for rule in rules
+    )
+    identifier_ranges = sorted({occurrence for term in protected_identifiers
+                                for occurrence in find_identifier_occurrences(term, block["text"])})
     pieces = []
     offset = 0
     while offset < len(block["text"]):
@@ -466,9 +538,8 @@ def split_evidence_block(
                 lower = midpoint
             else:
                 upper = midpoint - 1
-        # A split inside a catalog identifier would hide the complete identifier
-        # from both packets and remove its mapping during per-packet filtering.
-        # Leave that whole identifier for the next fragment instead.
+        # Keep both mapped and foreign longer identifiers whole. Splitting a
+        # foreign identifier could make its prefix look like this product.
         for identifier_start, identifier_end in reversed(identifier_ranges):
             if identifier_start < offset + lower < identifier_end:
                 lower = max(0, identifier_start - offset)
@@ -522,4 +593,8 @@ def package_evidence_blocks(group: dict[str, Any], max_packet_bytes: int) -> lis
     if current_packet["evidence"]:
         packets.append(current_packet)
     group["packaging_notes"] = sorted(set(group["packaging_notes"]))
-    return [filter_packet_identifier_mappings(packet) for packet in packets]
+    valid_occurrences = group.get("identifier_valid_occurrences")
+    valid_terms_by_evidence = ({block["evidence_id"]: find_validated_block_identifier_terms(block, valid_occurrences)
+                               for block in group["evidence_blocks"]}
+                              if valid_occurrences is not None else None)
+    return [filter_packet_identifier_mappings(packet, valid_terms_by_evidence) for packet in packets]

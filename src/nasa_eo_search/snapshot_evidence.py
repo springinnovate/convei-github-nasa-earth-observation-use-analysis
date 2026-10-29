@@ -19,6 +19,7 @@ import zipfile
 import zlib
 
 from nasa_eo_search.catalog_csv import build_product_csv_row
+from nasa_eo_search.dataset_identity import build_catalog_identity_rules, find_product_identifier_occurrences
 from nasa_eo_search.evidence_inputs import identify_evidence, read_evidence_json
 from nasa_eo_search.pipeline_catalog import read_pipeline_catalog
 from nasa_eo_search.pipeline_tables import FILE_MATCH_COLUMNS
@@ -32,6 +33,7 @@ MAX_MATCHING_WINDOWS = 12
 MATCHING_WINDOW_CHARACTERS = 600
 CONTEXT_LINE_COUNT = 10
 MAX_SNAPSHOT_FILE_BYTES = 2_000_000
+CATALOG_IDENTITY_POLICY = "longest-catalog-identifier-v1"
 
 
 def hash_snapshot_file(path: Path) -> str:
@@ -119,8 +121,32 @@ def build_snapshot_excerpt_citation(repository: str, commit: str, file_path: str
     return citation
 
 
+def validate_snapshot_matching_lines(source_lines: list[str], matches_by_term: dict[str, list[dict]]) -> None:
+    """Verify every broad scan hit against the pinned source before filtering.
+
+    Args:
+        source_lines: Complete decoded lines from the verified repository ZIP.
+        matches_by_term: Saved literal terms and their full matching-line records.
+
+    Raises:
+        ValueError: A saved line is malformed, absent, changed, or lacks its term.
+    """
+    for term, matching_lines in matches_by_term.items():
+        if not matching_lines:
+            raise ValueError("Snapshot scan match has no matching lines.")
+        for matching_line in matching_lines:
+            if not isinstance(matching_line, dict):
+                raise ValueError("Snapshot matching lines must be objects.")
+            number, text = matching_line.get("line_number"), matching_line.get("text")
+            if (type(number) is not int or number < 1 or number > len(source_lines)
+                    or not isinstance(text, str) or text != source_lines[number - 1]
+                    or not find_product_identifier_occurrences(term, text)):
+                raise ValueError("Saved snapshot match differs from its pinned source file.")
+
+
 def build_snapshot_file_excerpts(repository: str, commit: str, file_path: str,
-                                 source_lines: list[str], matches_by_term: dict[str, list[dict]]) -> dict:
+                                 source_lines: list[str], matches_by_term: dict[str, list[dict]],
+                                 identifier_identity_rules: dict | None = None) -> dict:
     """Build size-limited match excerpts and nearby code from one source file.
 
     First check that every saved match agrees with the ZIP's source text. Then
@@ -140,6 +166,8 @@ def build_snapshot_file_excerpts(repository: str, commit: str, file_path: str,
         source_lines: Complete decoded source lines, without newline terminators.
         matches_by_term: Catalog terms mapped to their saved matching_lines
             records, each containing one-based line_number and full line text.
+        identifier_identity_rules: Longer catalog identifiers and their ownership
+            for this product. Excerpt windows center only on surviving occurrences.
 
     Returns:
         Dictionary with matching_lines for the CSV, evidence citations for
@@ -150,38 +178,40 @@ def build_snapshot_file_excerpts(repository: str, commit: str, file_path: str,
         ValueError: If a saved matching line is missing, malformed, differs from
             source_lines, or does not contain its associated catalog term.
     """
+    validate_snapshot_matching_lines(source_lines, matches_by_term)
     matching_numbers: set[int] = set()
     terms_by_number: dict[int, set[str]] = {}
     for term, matching_lines in matches_by_term.items():
-        if not matching_lines:
-            raise ValueError("Snapshot scan match has no matching lines.")
-        pattern = re.compile(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])", re.IGNORECASE | re.ASCII)
         for matching_line in matching_lines:
-            if not isinstance(matching_line, dict):
-                raise ValueError("Snapshot matching lines must be objects.")
             number, text = matching_line.get("line_number"), matching_line.get("text")
-            if (type(number) is not int or number < 1 or number > len(source_lines)
-                    or not isinstance(text, str) or text != source_lines[number - 1]
-                    or pattern.search(text) is None):
-                raise ValueError("Saved snapshot match differs from its pinned source file.")
+            if not find_product_identifier_occurrences(term, text, identifier_identity_rules):
+                continue
             matching_numbers.add(number)
             terms_by_number.setdefault(number, set()).add(term)
     windows: list[tuple[int, int, int]] = []
     truncated = False
     for number in sorted(matching_numbers):
         line_text = source_lines[number - 1]
-        pattern = re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(
-            re.escape(term) for term in sorted(terms_by_number[number], key=lambda value: (-len(value), value))
-        ) + r")(?![A-Za-z0-9])", re.IGNORECASE | re.ASCII)
-        for occurrence in pattern.finditer(line_text):
-            if any(saved_number == number and start <= occurrence.start() and occurrence.end() <= end
+        if identifier_identity_rules:
+            occurrences = sorted({span for term in terms_by_number[number]
+                                  for span in find_product_identifier_occurrences(term, line_text, identifier_identity_rules)},
+                                 key=lambda span: (span[0], -span[1]))
+        else:
+            # Preserve historical non-overlapping window selection exactly so
+            # unchanged source can reuse frozen evidence and paid responses.
+            pattern = re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(
+                re.escape(term) for term in sorted(terms_by_number[number], key=lambda value: (-len(value), value))
+            ) + r")(?![A-Za-z0-9])", re.IGNORECASE | re.ASCII)
+            occurrences = [(match.start(), match.end()) for match in pattern.finditer(line_text)]
+        for occurrence_start, occurrence_end in occurrences:
+            if any(saved_number == number and start <= occurrence_start and occurrence_end <= end
                    for saved_number, start, end in windows):
                 continue
             if len(windows) == MAX_MATCHING_WINDOWS:
                 truncated = True
                 break
-            width = min(1000, max(MATCHING_WINDOW_CHARACTERS, occurrence.end() - occurrence.start()))
-            start = max(0, occurrence.start() - max(0, width - (occurrence.end() - occurrence.start())) // 2)
+            width = min(1000, max(MATCHING_WINDOW_CHARACTERS, occurrence_end - occurrence_start))
+            start = max(0, occurrence_start - max(0, width - (occurrence_end - occurrence_start)) // 2)
             end = min(len(line_text), start + width)
             windows.append((number, start, end))
         if len(windows) == MAX_MATCHING_WINDOWS and number != max(matching_numbers):
@@ -317,7 +347,7 @@ def build_snapshot_match_row(group: dict, file_record: dict) -> dict[str, str]:
 
 
 def read_snapshot_evidence_groups(output_directory: Path, catalog_override: Path | None = None,
-                                  *, allow_running: bool = False) -> dict[str, Any]:
+                                  *, allow_running: bool = False, apply_catalog_identity: bool = True) -> dict[str, Any]:
     """Read saved GitHub search files and group excerpts by repository/dataset.
 
     Read plan.json, summary.json, catalog.json, and snapshots.json; verify each
@@ -337,6 +367,9 @@ def read_snapshot_evidence_groups(output_directory: Path, catalog_override: Path
             catalog copy. It must contain exactly the same metadata.
         allow_running: True only when the search command is updating its reports.
             Classification leaves this False to reject a search still running.
+        apply_catalog_identity: Resolve overlapping identifiers using the frozen
+            catalog. False reconstructs the original broad associations solely
+            when resuming a legacy frozen classification plan.
 
     Returns:
         Dictionary accepted by file classification: groups contains one entry
@@ -379,6 +412,7 @@ def read_snapshot_evidence_groups(output_directory: Path, catalog_override: Path
         product_keys.add(identity)
         for signature in product["candidate_signatures"]:
             products_by_term.setdefault(signature["term"], []).append(product)
+    catalog_identity_rules = build_catalog_identity_rules(products) if apply_catalog_identity else {}
     if catalog_override is not None:
         override_summary, override_products = read_pipeline_catalog(catalog_override)
         if override_summary != catalog_summary or override_products != products:
@@ -387,6 +421,8 @@ def read_snapshot_evidence_groups(output_directory: Path, catalog_override: Path
     if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1 or not isinstance(manifest.get("repositories"), list):
         raise ValueError("Expected a schema-version-1 snapshot manifest.")
     groups: dict[tuple[str, str, str], dict] = {}
+    excluded_product_files = 0
+    excluded_identifier_occurrences = 0
     snapshot_identities = []
     seen_repositories = set()
     for snapshot in manifest["repositories"]:
@@ -445,19 +481,38 @@ def read_snapshot_evidence_groups(output_directory: Path, catalog_override: Path
         except (zipfile.BadZipFile, RuntimeError, zlib.error) as error:
             raise ValueError("Matched snapshot source cannot be read reliably.") from error
         for file_path, matches_by_term in sorted(file_matches.items()):
+            validate_snapshot_matching_lines(source_files[file_path], matches_by_term)
             product_matches: dict[tuple[str, str], dict] = {}
             for term, matching_lines in matches_by_term.items():
                 for product in products_by_term[term]:
                     key = (product["provider"], product["short_name"])
-                    product_matches.setdefault(key, {"product": product, "matches": {}})["matches"][term] = matching_lines
+                    rules = catalog_identity_rules.get(key, {})
+                    surviving_lines = []
+                    rejected_occurrences = 0
+                    for line in matching_lines:
+                        original_occurrences = find_product_identifier_occurrences(term, line["text"])
+                        surviving_occurrences = find_product_identifier_occurrences(term, line["text"], rules)
+                        rejected_occurrences += len(original_occurrences) - len(surviving_occurrences)
+                        if surviving_occurrences:
+                            surviving_lines.append(line)
+                    excluded_identifier_occurrences += rejected_occurrences
+                    association = product_matches.setdefault(key, {"product": product, "matches": {}, "identity_rules": {}})
+                    if surviving_lines:
+                        association["matches"][term] = surviving_lines
+                    if rejected_occurrences:
+                        association["identity_rules"][term] = rules[term]
             for product_key, association in sorted(product_matches.items()):
+                if not association["matches"]:
+                    excluded_product_files += 1
+                    continue
                 group_key = (repository, *product_key)
                 group = groups.setdefault(group_key, {
                     "group_id": identify_evidence(group_key), "repository": repository,
                     "product": association["product"], "files": [], "search_complete": False,
                     "warnings": ["Bounded GitHub discovery is not complete public-repository coverage; matches are candidate references, not verified use."],
                 })
-                file_excerpts = build_snapshot_file_excerpts(repository, commit, file_path, source_files[file_path], association["matches"])
+                rules = association["identity_rules"]
+                file_excerpts = build_snapshot_file_excerpts(repository, commit, file_path, source_files[file_path], association["matches"], rules)
                 snapshot_warnings = [f"Pinned snapshot scan status: {scan['status']}; {len(scan['skipped'])} files excluded.",
                                      f"Evidence truncated: {'yes' if file_excerpts['truncated'] else 'no'}; at most {MAX_MATCHING_WINDOWS} hit windows and {MAX_EVIDENCE_CHARACTERS} text characters. Full evidence retained in {scan_relative} and {zip_relative_path}.",
                                      "Snippet offsets are zero-based Unicode character ranges; line numbers are one-based. Context comes only from the saved snapshot."]
@@ -469,11 +524,23 @@ def read_snapshot_evidence_groups(output_directory: Path, catalog_override: Path
                           "sources": [{"term": term, "status": scan["status"], "latest_attempt": True} for term in sorted(association["matches"])],
                           "snapshot_evidence": file_excerpts["evidence"], "snapshot_evidence_truncated": file_excerpts["truncated"],
                           "snapshot_warnings": snapshot_warnings}
+                if rules:
+                    record["identifier_identity_rules"] = rules
+                    record["identifier_valid_occurrences"] = {
+                        term: [{"line_number": line["line_number"], "character_offset": start, "end_offset": end}
+                               for line in lines
+                               for start, end in find_product_identifier_occurrences(term, line["text"], rules)]
+                        for term, lines in association["matches"].items()
+                    }
                 record["snapshot_match_row"] = build_snapshot_match_row(group, record)
                 group["files"].append(record)
     if read_evidence_json(directory / "plan.json") != plan or read_evidence_json(directory / "snapshots.json") != manifest:
         raise ValueError("Snapshot sources changed while reading; stop the search and retry.")
-    return {"backend": "github", "groups": [group for _, group in sorted(groups.items())],
+    return {**({"dataset_identity_policy": CATALOG_IDENTITY_POLICY,
+                "identity_filtering": {"excluded_product_file_associations": excluded_product_files,
+                                       "excluded_identifier_occurrences": excluded_identifier_occurrences}}
+               if apply_catalog_identity else {}),
+            "backend": "github", "groups": [group for _, group in sorted(groups.items())],
             "catalog_status": catalog_summary["status"], "catalog_summary": catalog_summary,
             "search_scope": "Bounded public GitHub discovery; pinned local snapshot text; no exhaustive GitHub coverage or verified-use claim.",
             "selected_products": len(products), "source_batch_summary": summary,

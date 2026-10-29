@@ -98,6 +98,16 @@ Local matches are case-insensitive with ASCII non-alphanumeric boundaries:
 from saved metadata: short names, entry IDs, and collection concept IDs. Names
 such as `SEA` can still match ordinary words. A hit is not verified data use.
 
+GitHub match tables use the saved catalog to separate overlapping dataset names.
+For example, `SPL3SMP` inside the distinct `SPL3SMP_E` identifier belongs to the
+enhanced product. A separate `SPL3SMP` mention still gets its own row. Versions
+and filename suffixes remain valid matches when the catalog does not identify
+them as another product. Shared catalog identifiers retain every recorded owner.
+`summary.json` records excluded product/file associations and identifier
+occurrences per dataset association under `identity_filtering`; raw scans and
+ZIPs retain the original text. This check depends on the saved catalog and does
+not resolve unknown aliases.
+
 ### Bounds and resume
 
 | Option | New GitHub run behavior |
@@ -222,6 +232,13 @@ responses are reused. Keep the source search/catalog, model, and output-token
 settings unchanged. A changed search requires a new classification directory.
 Existing runs retain their saved prompt and inputs. Use a new `--output`
 directory to apply updated context packaging and category guidance.
+
+For GitHub runs, a new classification directory also applies catalog identity
+filtering to the saved snapshots. Older classification directories keep their
+original dataset associations and display a notice when resumed. No additional
+repository download is needed to prepare the new evidence. New model requests
+can incur charges; use `--dry-run` to inspect the count first.
+
 Failures or uncertain requests require `--retry-failed`; an interrupted request
 may already have incurred a charge.
 
