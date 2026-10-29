@@ -1,4 +1,4 @@
-"""Test bounded, non-extracting repository archive scans entirely offline."""
+"""Test repository ZIP scans, identifier boundaries, and file exclusions offline."""
 
 from pathlib import Path
 import random
@@ -10,23 +10,26 @@ from unittest.mock import patch
 import warnings
 import zipfile
 
-from nasa_eo_search.trial_scan import (
-    build_literal_term_matcher, find_literal_terms_in_line, scan_repository_archive,
+from nasa_eo_search.repository_scan import (
+    build_literal_term_matcher, find_literal_terms_in_line, scan_repository_zip,
 )
 
 
-def save_repository_archive(directory: Path, files: list[tuple[str | zipfile.ZipInfo, str | bytes]]) -> Path:
-    """Write a test-owned ZIP with supplied names, metadata, and contents.
+def save_repository_zip(directory: Path, files: list[tuple[str | zipfile.ZipInfo, str | bytes]]) -> Path:
+    """Save a repository ZIP fixture containing the supplied files.
 
     Args:
         directory: Existing temporary directory used only by the current test.
-        files: Archive member names or metadata paired with text or byte content.
+        files: ZIP entry names or metadata paired with text or byte content.
 
     Returns:
-        The new archive path.
+        The path to ``snapshot.zip`` in the temporary directory.
+
+    Raises:
+        OSError: If the temporary ZIP cannot be written.
     """
-    archive_path = directory / "snapshot.zip"
-    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    zip_path = directory / "snapshot.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             for name, content in files:
@@ -38,7 +41,7 @@ def save_repository_archive(directory: Path, files: list[tuple[str | zipfile.Zip
                     member.compress_type = zipfile.ZIP_DEFLATED
                     name = member
                 archive.writestr(name, content)
-    return archive_path
+    return zip_path
 
 
 class LiteralTermMatcherTests(unittest.TestCase):
@@ -85,8 +88,8 @@ class LiteralTermMatcherTests(unittest.TestCase):
         self.assertEqual(find_literal_terms_in_line("PRODUCT_00000 and product_33272", matcher), {"PRODUCT_00000", "PRODUCT_33272"})
 
 
-class RepositoryArchiveScanTests(unittest.TestCase):
-    """Keep every skipped input visible and never extract or execute source code."""
+class RepositoryZipScanTests(unittest.TestCase):
+    """Check scan matches and exclusion reasons without extracting source files."""
 
     def test_text_matches_preserve_files_terms_lines_and_unbounded_hit_count(self) -> None:
         """Report every matching line with its original spelling and exact location."""
@@ -94,8 +97,8 @@ class RepositoryArchiveScanTests(unittest.TestCase):
         content = "\r\n".join(lines)
         with TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            archive = save_repository_archive(directory, [("project-commit/code/run.py", content), ("project-commit/README.md", "Other")])
-            result = scan_repository_archive(archive, ["ATL03", "ATL03_007"])
+            archive = save_repository_zip(directory, [("project-commit/code/run.py", content), ("project-commit/README.md", "Other")])
+            result = scan_repository_zip(archive, ["ATL03", "ATL03_007"])
             self.assertEqual(result["status"], "complete")
             self.assertEqual(result["files_scanned"], 2)
             self.assertEqual(result["archive_root"], "project-commit")
@@ -110,8 +113,8 @@ class RepositoryArchiveScanTests(unittest.TestCase):
     def test_single_flat_file_keeps_its_name(self) -> None:
         """Do not mistake an archive's only file for an enclosing directory."""
         with TemporaryDirectory() as temporary:
-            archive = save_repository_archive(Path(temporary), [("README.md", "ATL03")])
-            result = scan_repository_archive(archive, ["ATL03"])
+            archive = save_repository_zip(Path(temporary), [("README.md", "ATL03")])
+            result = scan_repository_zip(archive, ["ATL03"])
             self.assertEqual(result["archive_root"], "")
             self.assertEqual(result["matches"][0]["file"], "README.md")
 
@@ -125,43 +128,43 @@ class RepositoryArchiveScanTests(unittest.TestCase):
         device_file.external_attr = (stat.S_IFCHR | 0o600) << 16
         unsafe_names = ["../escape.py", "/absolute.py", "C:/drive.py", "root/../escape.py", "root/./dot.py", "root\\backslash.py", "root/C:drive.py", "root//empty.py", "root/test:name.py", "root/control\nname.py"]
         with TemporaryDirectory() as temporary:
-            archive = save_repository_archive(Path(temporary), [(name, "ATL03") for name in unsafe_names] + [(symbolic_link, "ATL03"), (device_file, "ATL03")])
-            with patch("nasa_eo_search.trial_scan.zipfile.ZipFile.open", side_effect=AssertionError("Unsafe member read")):
-                result = scan_repository_archive(archive, ["ATL03"])
+            archive = save_repository_zip(Path(temporary), [(name, "ATL03") for name in unsafe_names] + [(symbolic_link, "ATL03"), (device_file, "ATL03")])
+            with patch("nasa_eo_search.repository_scan.zipfile.ZipFile.open", side_effect=AssertionError("Unsafe member read")):
+                result = scan_repository_zip(archive, ["ATL03"])
             self.assertEqual(result["status"], "incomplete")
             self.assertEqual(result["matches"], [])
             self.assertEqual(len(result["skipped"]), 12)
             self.assertEqual(result["bytes_read"], 0)
 
     def test_binary_non_utf8_and_lfs_files_are_explicit_gaps(self) -> None:
-        """Keep omitted formats and pointer-only objects out of false completion."""
+        """List binary, non-UTF-8, LFS, and submodule exclusions as incomplete."""
         with TemporaryDirectory() as temporary:
-            archive = save_repository_archive(Path(temporary), [
+            archive = save_repository_zip(Path(temporary), [
                 ("root/binary.bin", b"\x00ATL03"), ("root/latin.txt", b"\xffATL03"),
                 ("root/data.h5", "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 100\n"),
                 ("root/.gitmodules", '[submodule "nested"]\n path = nested\n url = https://example.com/ATL03\n'),
             ])
-            result = scan_repository_archive(archive, ["ATL03"])
+            result = scan_repository_zip(archive, ["ATL03"])
             self.assertEqual(result["status"], "incomplete")
             self.assertEqual({item["reason"] for item in result["skipped"]}, {"binary_file", "non_utf8_file", "git_lfs_content_not_in_snapshot", "submodule_contents_not_in_snapshot"})
             self.assertEqual(result["files_scanned"], 1)
             self.assertEqual(result["matches"][0]["file"], ".gitmodules")
 
     def test_size_limits_leave_small_later_files_searchable(self) -> None:
-        """Bound decompression while preserving matches from files that fit."""
+        """Skip files over the byte limits and still scan later files that fit."""
         with TemporaryDirectory() as temporary:
-            archive = save_repository_archive(Path(temporary), [("root/large.py", "ATL03 " * 20), ("root/small.py", "ATL03"), ("root/last.py", "ATL03")])
-            result = scan_repository_archive(archive, ["ATL03"], max_file_bytes=10, max_uncompressed_bytes=8)
+            archive = save_repository_zip(Path(temporary), [("root/large.py", "ATL03 " * 20), ("root/small.py", "ATL03"), ("root/last.py", "ATL03")])
+            result = scan_repository_zip(archive, ["ATL03"], max_file_bytes=10, max_uncompressed_bytes=8)
             self.assertEqual(result["bytes_read"], 5)
             self.assertEqual(result["files_scanned"], 1)
             self.assertEqual(result["matches"][0]["file"], "small.py")
             self.assertEqual([item["reason"] for item in result["skipped"]], ["file_size_limit", "archive_uncompressed_size_limit"])
 
     def test_file_count_limit_and_duplicate_paths_are_visible(self) -> None:
-        """Count considered entries and avoid conflating duplicate ZIP names."""
+        """Count duplicate ZIP names and report when the file limit is reached."""
         with TemporaryDirectory() as temporary:
-            archive = save_repository_archive(Path(temporary), [("root/a.py", "ATL03"), ("root/a.py", "ATL03"), ("root/b.py", "ATL03")])
-            result = scan_repository_archive(archive, ["ATL03"], max_files=2)
+            archive = save_repository_zip(Path(temporary), [("root/a.py", "ATL03"), ("root/a.py", "ATL03"), ("root/b.py", "ATL03")])
+            result = scan_repository_zip(archive, ["ATL03"], max_files=2)
             self.assertEqual(result["files_scanned"], 1)
             self.assertEqual(result["files_considered"], 3)
             self.assertEqual([item["reason"] for item in result["skipped"]], ["duplicate_archive_path", "file_count_limit"])
@@ -170,8 +173,8 @@ class RepositoryArchiveScanTests(unittest.TestCase):
     def test_duplicate_paths_remove_ambiguous_hits_without_losing_other_files(self) -> None:
         """Avoid choosing one duplicate ZIP entry as a real repository file."""
         with TemporaryDirectory() as temporary:
-            archive = save_repository_archive(Path(temporary), [("root/a.py", "ATL03"), ("root/a.py", "other"), ("root/b.py", "ATL03")])
-            result = scan_repository_archive(archive, ["ATL03"])
+            archive = save_repository_zip(Path(temporary), [("root/a.py", "ATL03"), ("root/a.py", "other"), ("root/b.py", "ATL03")])
+            result = scan_repository_zip(archive, ["ATL03"])
             self.assertEqual(result["status"], "incomplete")
             self.assertEqual([match["file"] for match in result["matches"]], ["b.py"])
             self.assertEqual(result["skipped"], [{"file": "a.py", "reason": "duplicate_archive_path"}])
@@ -179,9 +182,9 @@ class RepositoryArchiveScanTests(unittest.TestCase):
     def test_corrupt_member_reads_consume_the_attempted_decompression_budget(self) -> None:
         """Do not let repeated failed reads bypass the archive byte ceiling."""
         with TemporaryDirectory() as temporary:
-            archive = save_repository_archive(Path(temporary), [("root/a.py", "ATL03"), ("root/b.py", "ATL03")])
-            with patch("nasa_eo_search.trial_scan.zipfile.ZipFile.open", side_effect=zipfile.BadZipFile("Bad CRC")) as open_member:
-                result = scan_repository_archive(archive, ["ATL03"], max_uncompressed_bytes=5)
+            archive = save_repository_zip(Path(temporary), [("root/a.py", "ATL03"), ("root/b.py", "ATL03")])
+            with patch("nasa_eo_search.repository_scan.zipfile.ZipFile.open", side_effect=zipfile.BadZipFile("Bad CRC")) as open_member:
+                result = scan_repository_zip(archive, ["ATL03"], max_uncompressed_bytes=5)
             self.assertEqual(open_member.call_count, 1)
             self.assertEqual(result["uncompressed_bytes_budget_used"], 5)
             self.assertEqual([item["reason"] for item in result["skipped"]], ["archive_member_read_error", "archive_uncompressed_size_limit"])
@@ -191,26 +194,26 @@ class RepositoryArchiveScanTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             archive = Path(temporary) / "snapshot.zip"
             archive.write_bytes(b"not a zip")
-            result = scan_repository_archive(archive, ["ATL03"])
+            result = scan_repository_zip(archive, ["ATL03"])
             self.assertEqual(result["status"], "incomplete")
             self.assertEqual(result["skipped"][0]["reason"], "invalid_archive")
 
     def test_utf8_bom_is_supported(self) -> None:
         """Search UTF-8 text with a byte-order mark and preserve line numbering."""
         with TemporaryDirectory() as temporary:
-            archive = save_repository_archive(Path(temporary), [("root/readme.txt", "ATL03\n冰".encode("utf-8-sig"))])
-            result = scan_repository_archive(archive, ["ATL03"])
+            archive = save_repository_zip(Path(temporary), [("root/readme.txt", "ATL03\n冰".encode("utf-8-sig"))])
+            result = scan_repository_zip(archive, ["ATL03"])
             self.assertEqual(result["status"], "complete")
             self.assertEqual(result["matches"][0]["matching_lines"], [{"line_number": 1, "text": "ATL03"}])
 
     def test_invalid_terms_and_limits_fail_before_opening_archive(self) -> None:
-        """Reject invalid configuration without pretending a search completed."""
+        """Reject invalid terms and limits before trying to open the ZIP."""
         for terms in ([], [""], ["ATL03\n"], ["ATL03\x00"], [None], "ATL03"):
             with self.subTest(terms=terms), self.assertRaises(ValueError):
-                scan_repository_archive("nonexistent.zip", terms)
+                scan_repository_zip("nonexistent.zip", terms)
         for options in ({"max_files": 0}, {"max_files": True}, {"max_file_bytes": -1}, {"max_uncompressed_bytes": 1.5}):
             with self.subTest(options=options), self.assertRaises(ValueError):
-                scan_repository_archive("nonexistent.zip", ["ATL03"], **options)
+                scan_repository_zip("nonexistent.zip", ["ATL03"], **options)
 
 
 if __name__ == "__main__":

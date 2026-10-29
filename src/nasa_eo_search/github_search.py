@@ -1,4 +1,11 @@
-"""Resume bounded GitHub discovery and scan immutable public source snapshots."""
+"""Find public GitHub repositories, download their code, and report dataset matches.
+
+This module implements the GitHub backend of ``nasa-eo search``. A repository
+snapshot is a ZIP containing its files at one recorded Git commit. Search-page
+responses and download/scan progress are saved so the same command can resume
+without repeating successful requests. Small and large runs use this same code;
+command-line options set the request, repository, and download-size limits.
+"""
 
 from __future__ import annotations
 
@@ -18,11 +25,11 @@ from nasa_eo_search.batch_reports import write_protected_csv_rows
 from nasa_eo_search.evidence_context import RejectEvidenceRedirects
 from nasa_eo_search.pipeline_catalog import read_pipeline_catalog
 from nasa_eo_search.sourcegraph import build_tls_context
-from nasa_eo_search.trial_discovery import (
+from nasa_eo_search.repository_discovery import (
     resolve_public_repository_commit, search_github_code, search_grep_app,
     validate_repository_name, validate_search_term,
 )
-from nasa_eo_search.trial_scan import MATCHING_RULE, scan_repository_archive
+from nasa_eo_search.repository_scan import MATCHING_RULE, scan_repository_zip
 
 
 PLAN_DEFAULTS = {"github_pages": 10, "max_repositories": 6, "max_archive_mb": 100,
@@ -38,14 +45,14 @@ SNAPSHOT_STATUSES = {"pending", "pinned", "downloading", "downloaded", "complete
 
 
 def save_github_json(path: Path, value: Any) -> None:
-    """Atomically publish JSON owned by a GitHub search run.
+    """Save a search record as JSON, replacing its file only after writing finishes.
 
     Args:
         path: Destination inside the search output directory.
-        value: JSON-serializable receipt, manifest, or report metadata.
+        value: Request record, repository progress, settings, or summary to save.
 
     Raises:
-        OSError: If the output cannot be written or published.
+        OSError: If the temporary file cannot be written or moved into place.
     """
 
     with atomic_batch_output(path) as output:
@@ -53,13 +60,16 @@ def save_github_json(path: Path, value: Any) -> None:
 
 
 def hash_json_value(value: Any) -> str:
-    """Fingerprint a JSON value independently of indentation and key order.
+    """Calculate a reproducible SHA-256 checksum for a JSON-serializable value.
+
+    Dictionary key order and JSON indentation do not affect this checksum.
+    It is used to identify requests and check saved settings and responses.
 
     Args:
-        value: JSON-serializable configuration or discovery receipt.
+        value: Settings or a request record containing JSON-compatible values.
 
     Returns:
-        SHA-256 digest of canonical UTF-8 JSON bytes.
+        Lowercase hexadecimal checksum of consistently formatted UTF-8 JSON.
     """
 
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -67,13 +77,15 @@ def hash_json_value(value: Any) -> str:
 
 
 def hash_snapshot_file(path: Path) -> str:
-    """Hash a saved archive or scan without loading the entire file into memory.
+    """Calculate the SHA-256 checksum of a saved ZIP, scan result, or catalog.
+
+    Read one megabyte at a time so the whole file need not fit in memory.
 
     Args:
-        path: Existing regular evidence file.
+        path: File to read without changing it.
 
     Returns:
-        SHA-256 digest of all file bytes.
+        Lowercase hexadecimal checksum of the complete file.
 
     Raises:
         OSError: If the file cannot be read.
@@ -87,17 +99,18 @@ def hash_snapshot_file(path: Path) -> str:
 
 
 def safe_snapshot_path(output: Path, relative_path: str) -> Path:
-    """Resolve an evidence path without allowing traversal or symbolic links.
+    """Resolve a saved ZIP or JSON path and check that it stays inside the run.
 
     Args:
-        output: Search output directory containing the saved evidence.
-        relative_path: Forward-slash relative path from a saved manifest.
+        output: Search output directory that must contain the file.
+        relative_path: Path stored in a search record, using forward slashes.
 
     Returns:
-        Verified path strictly below the output directory.
+        File path inside ``output``. The file need not exist yet.
 
     Raises:
-        ValueError: If a path is absolute, unsafe, or crosses a symbolic link.
+        ValueError: If a path is absolute, contains parent-directory references,
+            leaves ``output``, or passes through a symbolic link.
     """
 
     if not isinstance(relative_path, str) or not relative_path or "\\" in relative_path:
@@ -117,19 +130,25 @@ def safe_snapshot_path(output: Path, relative_path: str) -> Path:
 
 
 def build_github_plan(arguments: argparse.Namespace, catalog: dict, saved: dict | None = None) -> dict:
-    """Freeze discovery selection and snapshot limits while retaining all datasets.
+    """Build the search settings for a new run or validate settings on resume.
+
+    Select which dataset short names to send to GitHub and record the page,
+    repository, and ZIP-size limits. Local scanning still uses every dataset in
+    the catalog. When resuming, omitted options use their saved values; a changed
+    catalog or changed fixed option is rejected rather than mixed with old results.
 
     Args:
-        arguments: Search command options; omitted persistent options retain saved values.
-        catalog: Validated full catalog with summary and products.
-        saved: Existing GitHub plan, or None for a new run.
+        arguments: Parsed search options, including catalog and output paths.
+        catalog: Complete catalog dictionary with ``summary`` and ``products``.
+        saved: Contents of an existing ``plan.json``, or None for a new run.
 
     Returns:
-        New plan or the exactly compatible saved plan. Request count is per
-        invocation and intentionally absent from persistent configuration.
+        Settings to save as ``plan.json``, or the unchanged compatible saved
+        settings. The per-invocation request limit is not part of this file.
 
     Raises:
-        ValueError: If selection, limits, backend, or frozen catalog differ.
+        ValueError: If the selected names or limits are invalid, or the saved
+            settings/catalog differ from the requested run.
     """
 
     if saved is not None and (saved.get("backend") != "github" or saved.get("schema_version") != 1
@@ -174,17 +193,20 @@ def build_github_plan(arguments: argparse.Namespace, catalog: dict, saved: dict 
 
 
 def discovery_receipt_path(output: Path, provider: str, term: str, page: int, attempt: int) -> Path:
-    """Locate one uniquely numbered discovery attempt without using terms as paths.
+    """Build the JSON filename for one attempt to fetch a search-result page.
+
+    Hash the provider, dataset term, and page number so dataset names never become
+    directory names. Include the attempt number to keep failed retries separate.
 
     Args:
         output: Search output directory.
-        provider: GitHub or Grep provider label.
+        provider: ``github`` or ``grep.app``.
         term: Literal dataset short name.
         page: One-based provider page number.
         attempt: One-based request-attempt number.
 
     Returns:
-        Deterministic JSON path under discovery/.
+        File path under ``output/discovery``; no file is created here.
     """
 
     identity = hash_json_value([provider, term, page])
@@ -192,14 +214,18 @@ def discovery_receipt_path(output: Path, provider: str, term: str, page: int, at
 
 
 def save_discovery_receipt(path: Path, receipt: dict) -> None:
-    """Save a request receipt with a checksum before or after its network call.
+    """Save one search-page request record and a checksum of its contents.
+
+    A receipt is the saved record of a request: its provider, term, page, attempt,
+    status, and returned public matches. Save it with status ``running`` before
+    the request, then replace it with the response so interruptions remain visible.
 
     Args:
-        path: Numbered attempt path owned by this run.
-        receipt: Request metadata and raw public-only provider response.
+        path: JSON filename for this page and attempt.
+        receipt: Request information and, if available, its public-only response.
 
     Raises:
-        OSError: If the checkpoint cannot be published.
+        OSError: If the request record cannot be saved.
     """
 
     payload = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
@@ -207,19 +233,23 @@ def save_discovery_receipt(path: Path, receipt: dict) -> None:
 
 
 def read_discovery_receipts(output: Path, plan: dict) -> list[dict]:
-    """Validate every saved discovery attempt before considering more requests.
+    """Read saved search-page request records and verify their checksums and fields.
+
+    Call this before resuming. Reject changed files, invalid filenames, and
+    records for a different search so they cannot be mistaken for completed work.
 
     Args:
-        output: Search output containing immutable numbered attempts.
-        plan: Frozen discovery terms and enabled providers.
+        output: Search output directory with request JSON files in ``discovery``.
+        plan: Saved settings listing the allowed terms, providers, and page limit.
 
     Returns:
-        Receipts sorted by term, provider, page, and attempt; older failed
-        responses remain available alongside later explicit retries.
+        Request records sorted by term, provider, page, and attempt. Failed
+        attempts are included even if a later retry succeeded.
 
     Raises:
-        OSError: If receipt files cannot be read.
-        ValueError: If evidence is corrupt, renamed, or belongs to another plan.
+        OSError: If the request directory or its files cannot be read.
+        ValueError: If a file is malformed, renamed, changed, or inconsistent
+            with the saved search settings.
     """
 
     receipts = []
@@ -256,13 +286,13 @@ def read_discovery_receipts(output: Path, plan: dict) -> list[dict]:
 
 
 def latest_discovery_receipts(receipts: list[dict]) -> dict[tuple, dict]:
-    """Select the latest saved attempt for each provider, term, and page.
+    """Return the highest-numbered request attempt for each search-result page.
 
     Args:
-        receipts: Validated attempts including historical failures.
+        receipts: Validated request records, including earlier failed attempts.
 
     Returns:
-        Mapping from request identity to its highest numbered attempt.
+        Mapping from ``(provider, term, page)`` to the latest request record.
     """
 
     latest = {}
@@ -275,23 +305,28 @@ def latest_discovery_receipts(receipts: list[dict]) -> dict[tuple, dict]:
 
 def collect_github_discovery(output: Path, plan: dict, receipts: list[dict], maximum_requests: int,
                              retry_incomplete: bool, ca_bundle: str | None) -> int:
-    """Request missing pages round-robin, checkpointing each call independently.
+    """Fetch unfinished search pages and save a record before and after each call.
+
+    Request page one for each term before moving to page two. Reuse successful
+    saved pages, stop at the invocation's request limit, and update ``receipts``
+    in place as requests start and finish. Optional grep.app calls occur only on
+    page one because that service does not expose pagination here.
 
     Args:
-        output: Search output directory held by the caller's exclusive lock.
-        plan: Frozen discovery selection and page limits.
-        receipts: Validated mutable receipt list, appended after each response.
+        output: Search output directory already locked by the caller.
+        plan: Saved terms, enabled services, and maximum pages per term.
+        receipts: Validated request records to update in place.
         maximum_requests: Maximum discovery calls during this invocation.
-        retry_incomplete: Explicit permission for one additional failed attempt
-            per request; successful earlier pages are never fetched again.
-        ca_bundle: Optional certificate bundle for Grep HTTP requests.
+        retry_incomplete: Allow one new attempt for a previously failed,
+            incomplete, or interrupted page during this invocation.
+        ca_bundle: Optional certificate-authority file for grep.app HTTPS calls.
 
     Returns:
         Number of discovery calls made in this invocation.
 
     Raises:
-        OSError: If checkpoints cannot be saved.
-        KeyboardInterrupt: If interrupted; the running receipt remains durable.
+        OSError: If a request record cannot be saved.
+        KeyboardInterrupt: If interrupted; its ``running`` record remains saved.
     """
 
     latest = latest_discovery_receipts(receipts)
@@ -332,16 +367,21 @@ def collect_github_discovery(output: Path, plan: dict, receipts: list[dict], max
 
 
 def reconcile_snapshot_repositories(receipts: list[dict], repositories: list[dict], plan: dict) -> list[dict]:
-    """Choose a stable, round-robin repository sample without injecting controls.
+    """Add newly discovered repositories and select which ones to download.
+
+    Keep previously selected repositories. Fill remaining slots by taking one
+    candidate from each term/service in turn, up to ``max_repositories``. Only
+    repositories returned by a search service are eligible; no examples are added
+    by hand. Each record lists the searches that found it.
 
     Args:
-        receipts: All saved public discovery responses, including partial results.
-        repositories: Existing manifest records whose selected slots are retained.
-        plan: Frozen discovery order and repository cap.
+        receipts: Saved request records, including partial public results.
+        repositories: Existing repository records from ``snapshots.json``.
+        plan: Saved dataset order and maximum number of repository downloads.
 
     Returns:
-        Existing and newly discovered repositories with provenance and explicit
-        selected or repository-cap statuses.
+        Repository records with ``discovered_by``, ``selected``, and ``status``
+        fields. Unselected candidates remain listed in the output.
     """
 
     by_repository = {row["repository"].lower(): dict(row) for row in repositories}
@@ -379,16 +419,20 @@ def reconcile_snapshot_repositories(receipts: list[dict], repositories: list[dic
 
 
 def validate_snapshot_manifest(output: Path, repositories: list[dict], plan: dict) -> None:
-    """Verify all cached evidence before permitting requests or report writes.
+    """Check repository records and the ZIP/scan files listed in snapshots.json.
+
+    Verify paths, checksums, statuses, unique repository names, and the selected
+    repository limit before making more requests or overwriting reports.
 
     Args:
-        output: Search output containing referenced ZIP and JSON files.
-        repositories: Saved snapshot manifest rows.
-        plan: Frozen maximum selected-repository count.
+        output: Search directory containing the recorded ZIP and scan JSON files.
+        repositories: The ``repositories`` list read from ``snapshots.json``.
+        plan: Saved settings with the maximum selected-repository count.
 
     Raises:
-        OSError: If referenced cached evidence cannot be read.
-        ValueError: If manifest identities, statuses, paths, or hashes are invalid.
+        OSError: If a saved ZIP or scan JSON file cannot be read.
+        ValueError: If a repository record is invalid, a saved file is missing or
+            changed, or the number of selected repositories exceeds the limit.
     """
 
     seen = set()
@@ -422,70 +466,81 @@ def validate_snapshot_manifest(output: Path, repositories: list[dict], plan: dic
         raise ValueError("Saved snapshot selection exceeds its repository limit.")
 
 
-def download_github_snapshot(repository: str, commit: str, destination: Path, maximum_bytes: int,
-                             ca_bundle: str | None = None) -> int:
-    """Download a fixed public archive without credentials, redirects, or extraction.
+def download_github_repository_zip(repository: str, commit: str, zip_destination_path: Path,
+                                   maximum_download_bytes: int, ca_bundle: str | None = None) -> int:
+    """Download a public repository's files at one Git commit as a ZIP file.
+
+    Download from GitHub's codeload service without credentials or redirects.
+    Write to a new ``.partial`` file and rename it to ``zip_destination_path``
+    only after success. A failed download keeps its partial bytes so subsequent
+    runs can count them against the total storage limit. Nothing is extracted.
 
     Args:
-        repository: Repository whose public visibility was verified before pinning.
-        commit: Full immutable Git commit SHA.
-        destination: New ZIP path; existing archives are never replaced.
-        maximum_bytes: Remaining compressed-byte budget for this download.
-        ca_bundle: Optional certificate authority bundle for the HTTPS request.
+        repository: GitHub repository already checked to be public.
+        commit: Full 40-character Git commit identifier to download.
+        zip_destination_path: New ZIP path; an existing file is never replaced.
+        maximum_download_bytes: Maximum compressed bytes to download. Detecting
+            an over-limit response can retain one additional byte.
+        ca_bundle: Optional certificate-authority file for the HTTPS connection.
 
     Returns:
-        Number of compressed bytes saved. Failed partial bytes are preserved and
-        counted against the aggregate budget on subsequent invocations.
+        Number of bytes in the successfully downloaded ZIP.
 
     Raises:
-        OSError: If network, TLS, file operations, or the socket timeout fail.
-        ValueError: If names are unsafe or byte/time limits are exceeded.
+        OSError: If the HTTPS request, file write, or 20-second socket timeout fails.
+        ValueError: If repository/commit inputs are invalid, the ZIP already
+            exists, or the byte limit or 90-second elapsed limit is exceeded.
     """
 
     repository_name = validate_repository_name(repository)
-    if not re.fullmatch(r"[0-9a-f]{40}", commit) or maximum_bytes < 1:
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or maximum_download_bytes < 1:
         raise ValueError("A pinned commit and positive remaining byte budget are required.")
-    if destination.exists():
+    if zip_destination_path.exists():
         raise ValueError("Snapshot destination already exists; refusing to replace it.")
     request = Request(f"https://codeload.github.com/{repository_name}/zip/{commit}",
                       headers={"User-Agent": "nasa-eo-github-search/0.1"})
     opener = build_opener(RejectEvidenceRedirects(), HTTPSHandler(context=build_tls_context(ca_bundle)))
-    partial = destination.with_suffix(".partial")
-    started, downloaded = time.monotonic(), 0
+    partial_zip_path = zip_destination_path.with_suffix(".partial")
+    download_started_at, downloaded_bytes = time.monotonic(), 0
     with opener.open(request, timeout=20) as response:
-        declared_size = response.headers.get("Content-Length")
-        if declared_size and int(declared_size) > maximum_bytes:
+        declared_zip_bytes = response.headers.get("Content-Length")
+        if declared_zip_bytes and int(declared_zip_bytes) > maximum_download_bytes:
             raise ValueError("Archive exceeds the compressed download budget.")
-        with partial.open("xb") as target:
+        with partial_zip_path.open("xb") as zip_output:
             while True:
-                if time.monotonic() - started > 90:
+                if time.monotonic() - download_started_at > 90:
                     raise ValueError("Archive exceeded the 90-second download budget.")
-                chunk = response.read(min(65536, maximum_bytes - downloaded + 1))
-                if not chunk:
+                zip_chunk = response.read(min(65536, maximum_download_bytes - downloaded_bytes + 1))
+                if not zip_chunk:
                     break
-                target.write(chunk)
-                downloaded += len(chunk)
-                if downloaded > maximum_bytes:
+                zip_output.write(zip_chunk)
+                downloaded_bytes += len(zip_chunk)
+                if downloaded_bytes > maximum_download_bytes:
                     raise ValueError("Archive exceeds the compressed download budget; partial bytes retained.")
-    partial.replace(destination)
-    return downloaded
+    partial_zip_path.replace(zip_destination_path)
+    return downloaded_bytes
 
 
 def scan_selected_snapshots(output: Path, plan: dict, catalog: dict, repositories: list[dict],
                              retry_incomplete: bool, ca_bundle: str | None) -> None:
-    """Download each selected fixed snapshot once and scan all catalog signatures.
+    """Download selected repository ZIPs and scan them for every catalog identifier.
+
+    Record each repository's default-branch commit before downloading. Save
+    progress to ``snapshots.json`` after each stage so a resumed run can reuse
+    an existing ZIP or completed scan. Failed downloads and scans are recorded
+    on their repository rows; other selected repositories can still proceed.
 
     Args:
-        output: Locked search output directory.
-        plan: Frozen repository and compressed-download budgets.
-        catalog: Full saved catalog, not merely the selected discovery products.
-        repositories: Mutable snapshot records checkpointed after each stage.
-        retry_incomplete: Whether failed network attempts may be retried explicitly.
-        ca_bundle: Optional certificate bundle for archive downloads.
+        output: Search output directory already locked by the caller.
+        plan: Saved per-ZIP and total compressed-download limits.
+        catalog: Full saved catalog, not just the products used to find repositories.
+        repositories: Repository records to update in place and save after each stage.
+        retry_incomplete: Retry failed or interrupted downloads when True.
+        ca_bundle: Optional certificate-authority file for ZIP downloads.
 
     Raises:
-        OSError: If durable manifests cannot be published.
-        KeyboardInterrupt: If interrupted; pinned/downloaded states remain saved.
+        OSError: If repository progress cannot be saved to ``snapshots.json``.
+        KeyboardInterrupt: If interrupted; completed commit/download steps remain saved.
     """
 
     terms = list(dict.fromkeys(candidate["term"] for product in catalog["products"]
@@ -508,21 +563,22 @@ def scan_selected_snapshots(output: Path, plan: dict, catalog: dict, repositorie
                 if available_bytes < 1:
                     raise ValueError("Aggregate compressed download budget has been exhausted.")
                 record["download_attempts"] = record.get("download_attempts", 0) + 1
-                archive_name = f"{hash_json_value(record['repository'].lower())}-attempt-{record['download_attempts']:06d}.zip"
-                archive_path = safe_snapshot_path(output, f"snapshots/{archive_name}")
+                zip_filename = f"{hash_json_value(record['repository'].lower())}-attempt-{record['download_attempts']:06d}.zip"
+                zip_path = safe_snapshot_path(output, f"snapshots/{zip_filename}")
                 record["status"] = "downloading"
                 save_github_json(output / "snapshots.json", {"schema_version": 1, "repositories": repositories})
                 print(f"Downloading pinned snapshot {record['repository']}...", file=sys.stderr, flush=True)
-                archive_bytes = download_github_snapshot(record["repository"], record["commit"], archive_path,
-                                                         available_bytes, ca_bundle)
-                record.update({"status": "downloaded", "archive_relative_path": f"snapshots/{archive_name}",
-                               "archive_sha256": hash_snapshot_file(archive_path), "error": ""})
-                record["metrics"]["archive_bytes"] = archive_bytes
+                downloaded_zip_bytes = download_github_repository_zip(
+                    record["repository"], record["commit"], zip_path, available_bytes, ca_bundle,
+                )
+                record.update({"status": "downloaded", "archive_relative_path": f"snapshots/{zip_filename}",
+                               "archive_sha256": hash_snapshot_file(zip_path), "error": ""})
+                record["metrics"]["archive_bytes"] = downloaded_zip_bytes
                 save_github_json(output / "snapshots.json", {"schema_version": 1, "repositories": repositories})
-            archive_path = safe_snapshot_path(output, record["archive_relative_path"])
+            zip_path = safe_snapshot_path(output, record["archive_relative_path"])
             started = time.monotonic()
-            scan = scan_repository_archive(archive_path, terms)
-            scan_path = archive_path.with_suffix(".scan.json")
+            scan = scan_repository_zip(zip_path, terms)
+            scan_path = zip_path.with_suffix(".scan.json")
             save_github_json(scan_path, scan)
             record.update({"status": scan["status"], "scan_relative_path": scan_path.relative_to(output).as_posix(),
                            "scan_sha256": hash_snapshot_file(scan_path), "error": ""})
@@ -539,14 +595,19 @@ def scan_selected_snapshots(output: Path, plan: dict, catalog: dict, repositorie
 
 
 def summarize_discovery_queries(plan: dict, receipts: list[dict]) -> list[dict]:
-    """Describe page progress and limits separately from global search coverage.
+    """Summarize saved page results for each dataset term and search service.
+
+    Use the latest attempt for each page to count distinct candidate files and
+    determine whether that query finished, needs more pages, hit its page limit,
+    or failed. A finished query still does not mean all of GitHub was searched.
 
     Args:
-        plan: Frozen discovery terms, providers, and page cap.
-        receipts: Saved attempts, including partial results and failures.
+        plan: Saved terms, enabled services, and page limit.
+        receipts: Saved request records, including partial results and failures.
 
     Returns:
-        One report row per term/provider with explicit operational status.
+        One ``searches.csv`` row per term/service, including page and candidate
+        counts, warnings, and status. ``search_complete`` is always False.
     """
 
     latest = latest_discovery_receipts(receipts)
@@ -579,23 +640,28 @@ def summarize_discovery_queries(plan: dict, receipts: list[dict]) -> list[dict]:
 def publish_github_reports(output: Path, plan: dict, catalog: dict, receipts: list[dict],
                             repositories: list[dict], requests_this_run: int,
                             forced_status: str | None = None) -> dict:
-    """Publish current tables and bounded local evidence from durable receipts.
+    """Write search, repository, and matching-file reports from saved run records.
+
+    Rebuild the four CSV tables and ``summary.json``. Matching-file snippets are
+    generated from verified ZIPs by the same code used to prepare classification
+    input. This keeps the readable report and model input tied to the same files.
 
     Args:
         output: Search output directory.
-        plan: Frozen discovery and snapshot plan.
-        catalog: Saved full catalog.
-        receipts: All saved discovery attempts.
-        repositories: Current snapshot records.
-        requests_this_run: Count of calls made in the current invocation.
-        forced_status: Running or interrupted override while work is ongoing.
+        plan: Saved search settings.
+        catalog: Saved dictionary containing all catalog products.
+        receipts: All saved search-page request records.
+        repositories: Current repository download/scan records.
+        requests_this_run: Search-service calls made in this invocation.
+        forced_status: Optional ``running`` or ``interrupted`` summary status.
 
     Returns:
-        Saved summary whose status concerns execution, never all-GitHub coverage.
+        The summary dictionary written to ``summary.json``. Its status describes
+        the configured work, not coverage of all public GitHub code.
 
     Raises:
-        OSError: If reports cannot be published.
-        ValueError: If cached evidence fails the shared classification validator.
+        OSError: If saved files cannot be read or reports cannot be written.
+        ValueError: If saved ZIPs or scan records fail validation.
     """
 
     from nasa_eo_search.snapshot_evidence import (
@@ -636,24 +702,31 @@ def publish_github_reports(output: Path, plan: dict, catalog: dict, receipts: li
 
 
 def search_github_catalog(arguments: argparse.Namespace) -> int:
-    """Search bounded GitHub pages, resume saved snapshots, and write file tables.
+    """Search for catalog names on GitHub, scan repository ZIPs, and write CSVs.
 
-    Inputs are a finished NASA catalog, output directory, optional discovery short
-    names, and explicit request/download limits. The full catalog is scanned in
-    each selected immutable public snapshot without executing downloaded code.
+    This is the GitHub implementation of ``nasa-eo search``. Read the saved NASA
+    catalog, fetch search pages within the requested limits, choose repositories,
+    and download each at a recorded commit. Scan every catalog identifier in each
+    selected ZIP and write one row per dataset/file match to ``matches.csv``.
+    An existing output directory resumes from its saved pages and download/scan
+    progress. Downloaded code is read as text, never executed.
 
     Args:
-        arguments: Search CLI namespace. Missing persistent options use saved
-            values or new-run defaults; max_requests defaults to ten per call.
+        arguments: Parsed command-line options: catalog/output directories,
+            optional short names, limits, retry flag, dry-run flag, and certificate
+            file. Omitted fixed options use saved values when resuming. The
+            request limit defaults to ten new search-service calls per invocation.
 
     Returns:
-        Zero for a dry run or operationally complete bounded run, four for
-        limits/pending work, one for failures, or 130 after interruption.
+        Exit status: 0 for a dry run or completed configured work; 4 when limits,
+        skipped files, or pending work remain; 1 for service/download/report
+        failures; or 130 after interruption.
 
     Raises:
-        OSError: If catalog or evidence files cannot be accessed.
-        ValueError: If inputs differ, limits are invalid, or cached evidence is
-            damaged. Existing damaged evidence is never silently replaced.
+        OSError: If startup cannot read the catalog or saved files, create the
+            output directory, or acquire its lock.
+        ValueError: If startup options are invalid or conflict with saved settings,
+            or saved files are changed or damaged. They are not replaced silently.
     """
 
     maximum_requests = getattr(arguments, "max_requests", None)

@@ -49,10 +49,15 @@ def collect_dataset_table(arguments: argparse.Namespace) -> int:
 
 
 def search_dataset_catalog(arguments: argparse.Namespace) -> int:
-    """Select the new GitHub workflow or resume a saved Sourcegraph search.
+    """Search the catalog with GitHub or Sourcegraph, retaining the saved backend.
+
+    New output directories default to GitHub unless ``--backend`` is supplied.
+    For an existing directory, read ``plan.json`` to choose the same backend
+    and reject incompatible options before handing work to that search command.
 
     Args:
-        arguments: Search inputs, backend selection, and bounded-run options.
+        arguments: Catalog/output paths, backend selection, dataset filters,
+            request and download limits, and resume/dry-run options.
 
     Returns:
         Backend exit status: zero for success/preview, four for incomplete work,
@@ -84,7 +89,11 @@ def search_dataset_catalog(arguments: argparse.Namespace) -> int:
 
 
 def search_sourcegraph_catalog(arguments: argparse.Namespace) -> int:
-    """Search all selected catalog terms or resume their saved search plan.
+    """Run or resume Sourcegraph queries for the selected catalog datasets.
+
+    New runs split queries into repository groups and save progress in the
+    output directory. Existing runs reuse their saved query plan. A dry run
+    prints query counts without making requests or writing files.
 
     Args:
         arguments: Source catalog, output directory, optional exact product filters,

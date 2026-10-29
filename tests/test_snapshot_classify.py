@@ -20,7 +20,7 @@ from test_snapshot_evidence import create_snapshot_inputs
 
 
 class SnapshotClassificationTests(unittest.TestCase):
-    """Preserve original bounded rows through dry runs, classification, and resume."""
+    """Preserve original search rows through dry runs, classification, and resume."""
 
     def setUp(self) -> None:
         """Prevent tests from reading real keys or fetching any public context."""
@@ -58,7 +58,7 @@ class SnapshotClassificationTests(unittest.TestCase):
             self.context_loader.assert_not_called()
             self.context_tls.assert_not_called()
 
-    def test_long_line_classification_is_bounded_and_retains_real_offsets(self) -> None:
+    def test_long_line_classification_limits_text_and_retains_real_offsets(self) -> None:
         """Never send an entire megabyte line to classify one far-offset match."""
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -76,7 +76,7 @@ class SnapshotClassificationTests(unittest.TestCase):
             self.assertLess(len(read_classified_file_rows(arguments.output)[0]["snippet"]), 12_000)
 
     def test_dry_run_has_no_writes_network_or_credential_reads(self) -> None:
-        """Estimate locally from pinned context without producing paid side effects."""
+        """Preview request counts from saved ZIP text without writes or API calls."""
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             create_snapshot_inputs(root)
@@ -108,7 +108,7 @@ class SnapshotClassificationTests(unittest.TestCase):
                 self.key_loader.assert_not_called()
 
     def test_changed_archive_is_rejected_before_key_reads_or_model_calls(self) -> None:
-        """Protect frozen assessments from changed source bytes on resume."""
+        """Reject a modified source ZIP before reading a key or calling the model."""
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             directory, _ = create_snapshot_inputs(root)

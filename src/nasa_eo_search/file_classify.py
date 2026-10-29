@@ -44,14 +44,16 @@ def resolve_file_classification_catalog(batch_directory: Path, catalog_directory
 
 
 def split_repository_groups_into_files(source_plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Keep every dataset/file/revision match independent during classification.
+    """Split repository/product groups into one group per matching file and commit.
 
-    Preserve the original search table row before adding context. File-specific
-    provenance warnings are recalculated so another matching file cannot affect
-    this assessment. Product-search and source-catalog coverage still apply.
+    Copy each original search-table row so the classification CSV can retain it.
+    Recalculate warnings about failed or historical searches for each file,
+    rather than carrying over warnings that apply only to another file. Keep
+    warnings about catalog coverage and the product search on every group.
 
     Args:
-        source_plan: Unenriched repository/product groups from saved search data.
+        source_plan: Saved-search data containing repository/product groups,
+            each with a ``files`` list and search-status warnings.
 
     Returns:
         Independent groups, each containing exactly one matched file and revision.
@@ -84,18 +86,20 @@ def split_repository_groups_into_files(source_plan: dict[str, Any]) -> list[dict
 
 
 def identify_file_classification_source(source_plan: dict[str, Any]) -> str:
-    """Fingerprint evidence and coverage independently of report regeneration or location.
+    """Calculate the hash used to check that classification inputs have not changed.
 
     Match text, file revisions, product metadata, source-query status, and relevant
     catalog coverage remain part of the identity. Generated batch summaries,
     elapsed times, timestamps, and local directory paths do not. Rewriting reports
-    or relocating an unchanged catalog therefore does not invalidate paid receipts.
+    or relocating an unchanged catalog therefore does not prevent reuse of
+    saved model responses.
 
     Args:
-        source_plan: Unenriched saved-search groups and source metadata.
+        source_plan: Saved file matches, product descriptions, and search/catalog
+            status, before adding downloaded context or classification results.
 
     Returns:
-        Stable semantic source hash used to validate file-classification resumes.
+        SHA-256 hex digest compared with ``source_evidence_id`` when resuming.
     """
     catalog_coverage_fields = (
         "schema_version", "status", "source_url", "scope", "short_name_filter", "grouping",
@@ -115,28 +119,32 @@ def build_file_classification_plan(
     source_plan: dict[str, Any], offline: bool, context_lines: int,
     packet_bytes: int, ca_bundle: str | None,
 ) -> dict[str, Any]:
-    """Prepare one independently scoped evidence assessment per saved file match.
+    """Build model-input packets for each dataset/file/commit match.
 
-    Reuse the existing context collection and bounded packet packaging for
-    Sourcegraph evidence. GitHub snapshots use their already bounded local
-    excerpts without requesting public context. No matching code from another
-    file is supplied as classification evidence.
+    For Sourcegraph matches, fetch nearby source lines and README context unless
+    ``offline`` is true. For GitHub matches, use the saved ZIP excerpts without
+    making context requests. Split each file's text and product metadata into
+    JSON packets that fit ``packet_bytes``. Do not include matches from another
+    file in the same assessment. This function makes no model calls or writes.
 
     Args:
-        source_plan: Original saved-search groups and catalog metadata.
+        source_plan: Saved file matches grouped by repository and product, with
+            catalog metadata and search-status warnings.
         offline: Use saved Sourcegraph lines without fetching public context.
-            Snapshot evidence always uses its frozen local context.
+            GitHub matches always use their previously selected ZIP excerpts.
         context_lines: Sourcegraph surrounding lines per match. Snapshot context
-            is already bounded when its original readable row is created.
-        packet_bytes: Maximum serialized bytes of each complete model packet.
+            was selected when the readable search-table row was created.
+        packet_bytes: Maximum UTF-8 bytes of a serialized evidence packet,
+            including file identity, but excluding the API request wrapper.
         ca_bundle: Optional certificate authority bundle for public downloads.
 
     Returns:
-        New file-level plan with stable source identity and preserved match rows.
-        Groups that cannot be packaged remain explicit blocked assessments.
+        Plan containing the original table rows, source-input hash, and a list
+        of packets per file. A file that cannot fit the size limit has no
+        packets and a ``preparation_error`` explaining why it is blocked.
 
     Raises:
-        SourcegraphError: If verified transport configuration is invalid.
+        SourcegraphError: If the HTTPS certificate configuration is invalid.
     """
     snapshot_backend = source_plan.get("backend") == "github"
     if not offline and not snapshot_backend:
@@ -176,14 +184,16 @@ def build_file_classification_plan(
 
 
 def preview_file_classification_plan(plan: dict[str, Any], arguments: argparse.Namespace) -> int:
-    """Describe an unsaved file plan without credentials, output writes, or API calls.
+    """Print the file count, planned request count, and request bytes for a dry run.
 
     Args:
-        plan: In-memory plan prepared from saved matching lines only.
+        plan: In-memory plan prepared from saved matches and, for GitHub,
+            nearby lines from the downloaded ZIPs.
         arguments: Model settings and optional request limit.
 
     Returns:
-        Zero after printing the offline estimate and its context-size limitation.
+        Zero after printing the estimate. No credentials are read, files
+        written, or API requests made.
 
     Raises:
         ValueError: If the requested model or generated-token limit is invalid.
@@ -207,17 +217,19 @@ def preview_file_classification_plan(plan: dict[str, Any], arguments: argparse.N
 
 
 def classify_file_matches(arguments: argparse.Namespace) -> int:
-    """Classify or resume saved file matches and write an annotated match table.
+    """Classify saved file matches and write ``classified-matches.csv``.
 
-    A new output is prepared automatically. Existing file-level outputs reuse
-    their frozen context and successful receipts only when the saved search and
-    catalog still match. Repository-level runs are never reinterpreted as file
-    judgments. With no request cap, all eligible requests are selected; failed
-    or uncertain requests still require explicit retry authorization.
+    A new output directory gets a plan containing source excerpts, product
+    descriptions, and model-input packets. An existing file-level run reuses
+    that plan and its successful model responses only if the source search and
+    catalog are unchanged. Repository-level output cannot be resumed here.
+    Without a request cap, all pending packets may incur paid requests; failed
+    or uncertain requests require the retry flag. A dry run prints a preview
+    without making model requests or writing output.
 
     Args:
         arguments: Saved batch/catalog paths, output directory, model/credential
-            options, context bounds, optional request cap, and dry-run/retry flags.
+            options, context/packet size limits, request cap, and dry-run/retry flags.
 
     Returns:
         Zero for completed processing or a dry run, four for unfinished/blocked
@@ -225,8 +237,8 @@ def classify_file_matches(arguments: argparse.Namespace) -> int:
 
     Raises:
         OSError: If source files or output cannot be accessed.
-        ValueError: If bounds, sources, or resumed output are incompatible.
-        SourcegraphError: If verified transport configuration is invalid.
+        ValueError: If limits, source data, or resumed output are incompatible.
+        SourcegraphError: If the HTTPS certificate configuration is invalid.
     """
     if arguments.packet_bytes < 4096 or not 0 <= arguments.context_lines <= 100:
         raise ValueError("--packet-bytes must be at least 4096; --context-lines must be 0 through 100.")

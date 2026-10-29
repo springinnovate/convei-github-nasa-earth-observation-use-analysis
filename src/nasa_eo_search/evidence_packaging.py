@@ -45,33 +45,44 @@ def separate_conflicting_line_fragments(
 def reassemble_evidence_lines(
     evidence: list[dict[str, Any]], matching_files: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Rejoin saved line fragments without repeating per-fragment metadata.
+    """Join adjacent excerpts from the same source line, keeping their citations.
+
+    The ``evidence`` argument supplies every excerpt to include in the result.
+    Complete lines in ``matching_files`` are used only to check whether two
+    excerpts came from conflicting versions of a line. A shortened excerpt
+    cannot serve as a complete-line comparison, so it is left out of that
+    lookup, not removed from the evidence being returned.
 
     Args:
-        evidence: Raw evidence records retained unchanged in the saved plan.
-        matching_files: Optional saved files with complete matching-line text,
-            used to distinguish contradictory alternatives at one source location.
+        evidence: Excerpts with text, source location, character offset, and
+            citation ID. This list is not modified.
+        matching_files: Optional file records with matching-line text. Only
+            whole lines are used to distinguish conflicting source text;
+            records marked ``excerpt`` or carrying ``character_offset`` are
+            not whole-line comparisons, even when their offset is zero.
 
     Returns:
         Ordered line records with all raw citation IDs and character offsets.
         Missing character ranges remain separate records rather than being joined.
         Conflicting variants without original provenance remain separate fragments.
     """
-    original_lines_by_location: dict[tuple[str, str, int], list[str]] = defaultdict(list)
+    complete_lines_by_location: dict[tuple[str, str, int], list[str]] = defaultdict(list)
     for file_record in matching_files or []:
         for matching_line in file_record.get("matching_lines", []):
             if matching_line.get("excerpt") or "character_offset" in matching_line:
-                # Snapshot windows retain actual offsets but are not complete
-                # alternative source lines, even when an excerpt starts at zero.
+                # This lookup is only for comparing whole lines. The excerpt
+                # still enters fragments_by_line through `evidence` below.
+                # Treating two different windows as whole lines would falsely
+                # report conflicting source text at the same file/line.
                 continue
-            original_lines_by_location[(file_record["file"], file_record.get("commit") or "",
+            complete_lines_by_location[(file_record["file"], file_record.get("commit") or "",
                                         matching_line["line_number"])].append(matching_line["text"])
     fragments_by_line = defaultdict(list)
     for item in evidence:
         fragments_by_line[(item["file"], item["commit"] or "", item["line_number"], item["kind"])].append(item)
     lines = []
     for line_identity, fragments in sorted(fragments_by_line.items()):
-        original_lines = original_lines_by_location.get(line_identity[:3], []) if line_identity[3] == "matching_line" else []
+        original_lines = complete_lines_by_location.get(line_identity[:3], []) if line_identity[3] == "matching_line" else []
         fragment_groups, conflicting_fragments = separate_conflicting_line_fragments(fragments, original_lines)
         for fragment_group in fragment_groups:
             current_line = None

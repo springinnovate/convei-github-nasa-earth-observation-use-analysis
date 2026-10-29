@@ -1,4 +1,10 @@
-"""Make bounded, public-only discovery requests for the provider comparison."""
+"""Find public GitHub files through GitHub code search and grep.app.
+
+The search command uses these functions for both small samples and larger runs;
+page limits are arguments, not a separate trial implementation. GitHub requests
+use the user's GitHub CLI login. grep.app requests use its public Model Context
+Protocol (MCP) endpoint, which accepts a JSON tool call and returns search text.
+"""
 
 from __future__ import annotations
 
@@ -27,16 +33,17 @@ PUBLIC_SEARCH_FILTER = (
 
 
 def validate_repository_name(repository: str) -> str:
-    """Validate a GitHub repository name before constructing requests.
+    """Check a GitHub repository name and remove its optional host prefix.
 
     Args:
-        repository: Owner/repository or github.com/owner/repository identifier.
+        repository: ``owner/repository`` or ``github.com/owner/repository``.
 
     Returns:
-        The validated owner/repository identifier without a host prefix.
+        The ``owner/repository`` string to include in a GitHub API URL.
 
     Raises:
-        ValueError: If the identifier contains another host or unsafe components.
+        ValueError: If the owner or repository name has invalid characters, or
+            the repository is named ``.`` or ``..``.
     """
 
     repository_name = repository.removeprefix("github.com/")
@@ -48,13 +55,14 @@ def validate_repository_name(repository: str) -> str:
 
 
 def validate_search_term(term: str) -> None:
-    """Reject empty, excessively long, or query-breaking discovery terms.
+    """Check that a dataset identifier can be sent as one quoted search term.
 
     Args:
-        term: Literal NASA product signature to send to a search provider.
+        term: Dataset name or other literal identifier, such as ``ATL03``.
 
     Raises:
-        ValueError: If the term cannot be represented by this bounded trial.
+        ValueError: If the term is blank, longer than 256 characters, or contains
+            a double quote, newline, carriage return, or NUL character.
     """
 
     if not isinstance(term, str) or not term.strip() or len(term) > 256:
@@ -64,13 +72,17 @@ def validate_search_term(term: str) -> None:
 
 
 def run_github_json(arguments: list[str]) -> Any:
-    """Run a bounded GitHub CLI read without exposing credentials or stderr.
+    """Run ``gh api`` and parse its JSON output.
+
+    GitHub CLI supplies authentication from its own configuration. This function
+    waits at most 40 seconds and rejects output larger than 4 MiB. Failure
+    messages omit the command's raw error output, which may contain credentials.
 
     Args:
         arguments: Arguments following ``gh api``; callers supply GET requests.
 
     Returns:
-        Parsed JSON returned by GitHub CLI.
+        The JSON object, array, or value printed by GitHub CLI.
 
     Raises:
         RuntimeError: If GitHub CLI is missing, fails, times out, or returns an
@@ -89,7 +101,7 @@ def run_github_json(arguments: list[str]) -> Any:
             f"GitHub CLI request failed (exit {response.returncode}); check authentication or rate limits."
         )
     if len(response.stdout) > MAX_RESPONSE_BYTES:
-        raise RuntimeError("GitHub response exceeded the 4 MiB trial limit.")
+        raise RuntimeError("GitHub response exceeded the 4 MiB response limit.")
     try:
         return json.loads(response.stdout)
     except (ValueError, UnicodeError) as error:
@@ -97,23 +109,30 @@ def run_github_json(arguments: list[str]) -> Any:
 
 
 def search_github_code(term: str, max_pages: int = 1, *, start_page: int = 1) -> dict[str, Any]:
-    """Discover public candidate files using GitHub's legacy code-search API.
+    """Search GitHub for files containing a dataset identifier.
 
     Calls are spaced at least 6.1 seconds apart within this Python process. The
     GitHub CLI manages authentication; no token is read by this module. Private
     and unknown-visibility results are discarded by CLI filtering and checked
-    again before persistence. Search snippets are candidates, not usage proof.
+    again before adding them to the returned result. The caller saves this result
+    and decides which repositories to download. A matching name alone does not
+    establish that the code uses the dataset.
 
     Args:
-        term: Literal product signature; punctuation follows legacy API rules.
+        term: Dataset name or identifier; punctuation follows the legacy
+            GitHub code-search API's matching rules.
         max_pages: Maximum 100-result pages to request, between one and ten.
         start_page: First page to request, allowing a saved run to resume without
             fetching earlier pages. The requested range cannot exceed page ten.
 
     Returns:
-        A receipt with provider, query, status, normalized results, sanitized
-        public-only response pages, timing, and coverage warnings. Status is
-        returned, capped, incomplete, or error; none means all GitHub was searched.
+        A dictionary with the query, elapsed time, warnings, and ``results``
+        containing repository/file/URL records. ``raw`` holds response pages
+        after nonpublic matches have been removed. ``status`` is ``returned``
+        when the requested query has no more pages, ``capped`` when more pages
+        remain, ``incomplete`` when GitHub reports missing results, or ``error``
+        when a request fails. Partial results survive a later request failure.
+        None of these statuses establishes that all public GitHub code was searched.
 
     Raises:
         ValueError: If a term or page bound is invalid.
@@ -199,15 +218,19 @@ def search_github_code(term: str, max_pages: int = 1, *, start_page: int = 1) ->
     return receipt
 
 
-def decode_mcp_response(response_body: bytes, content_type: str) -> dict[str, Any]:
-    """Decode a bounded Model Context Protocol JSON or event-stream response.
+def decode_grep_app_response(response_body: bytes, content_type: str) -> dict[str, Any]:
+    """Read grep.app's JSON response from a plain body or an event stream.
+
+    grep.app's Model Context Protocol service may return one JSON object or a
+    sequence of server-sent events. In either form, select the response whose
+    request ID is 1, the ID used by ``search_grep_app``.
 
     Args:
-        response_body: Complete HTTP body within the trial's response-size limit.
+        response_body: Complete HTTP response bytes; the caller checks the size.
         content_type: HTTP Content-Type value.
 
     Returns:
-        The JSON-RPC response envelope matching this module's request ID.
+        The response dictionary, including its ``result`` or ``error`` field.
 
     Raises:
         ValueError: If no matching valid response is present.
@@ -225,14 +248,18 @@ def decode_mcp_response(response_body: bytes, content_type: str) -> dict[str, An
 
 
 def parse_grep_search_results(envelope: dict[str, Any]) -> list[dict[str, str]]:
-    """Extract validated repository/file locations from Grep's public text results.
+    """Extract repository names, paths, and URLs from grep.app result text.
 
     Args:
-        envelope: JSON-RPC envelope returned by Grep's searchGitHub tool.
+        envelope: Decoded response from grep.app's ``searchGitHub`` tool, with
+            result text blocks under ``result.content``.
 
     Returns:
-        Distinct public GitHub file locations; empty for an explicit no-results
-        response. Snippet contents remain untrusted evidence in the raw receipt.
+        One dictionary per distinct repository/file pair, with ``repository``,
+        ``file``, and ``url`` fields. An explicit "no results found" response
+        returns an empty list; an unrecognized response raises an error instead.
+        This function does not download files or check repository visibility;
+        that check occurs before the caller downloads a repository ZIP.
 
     Raises:
         ValueError: If the service reports an error or its response format changes.
@@ -275,17 +302,23 @@ def parse_grep_search_results(envelope: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def search_grep_app(term: str, ca_bundle_path: str | None = None) -> dict[str, Any]:
-    """Run one bounded query through Grep's documented public MCP service.
+    """Search grep.app once for a dataset identifier and return matching files.
+
+    The request times out after 30 seconds and the response is limited to 4 MiB.
+    Matches use ASCII letter/digit boundaries: ``ATL03_007`` can match ``ATL03``
+    while ``MATL03`` cannot. The service supplies a ranked sample, not a complete
+    list of results or a way to request another page.
 
     Args:
-        term: Literal product signature, matched with ASCII alphanumeric
-            boundaries so underscores separate identifiers but MATL03 does not.
-        ca_bundle_path: Optional PEM certificate bundle for this HTTP request.
+        term: Dataset name or other literal identifier to find in public code.
+        ca_bundle_path: Optional path to trusted certificate-authority
+            certificates in PEM format for this HTTPS connection.
 
     Returns:
-        A receipt with candidate files, raw response, timing, and warnings.
-        Successful status is always limited because the MCP tool exposes no
-        pagination or total count. Error receipts contain no credentials.
+        A dictionary with repository/file/URL records in ``results``, the
+        decoded service response in ``raw``, elapsed time, and warnings.
+        ``status`` is ``limited`` on success because no pagination or total
+        count is available, or ``error`` on a request or parsing failure.
 
     Raises:
         ValueError: If the search term is invalid.
@@ -305,14 +338,14 @@ def search_grep_app(term: str, ca_bundle_path: str | None = None) -> dict[str, A
     }}
     request = Request(GREP_MCP_ENDPOINT, data=json.dumps(request_body).encode("utf-8"), headers={
         "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-        "MCP-Protocol-Version": "2025-06-18", "User-Agent": "nasa-eo-provider-trial/0.1",
+        "MCP-Protocol-Version": "2025-06-18", "User-Agent": "nasa-eo-repository-discovery/0.1",
     })
     try:
         with urlopen(request, timeout=30, context=build_tls_context(ca_bundle_path)) as response:
             response_body = response.read(MAX_RESPONSE_BYTES + 1)
             if len(response_body) > MAX_RESPONSE_BYTES:
-                raise ValueError("Grep response exceeded the 4 MiB trial limit.")
-            receipt["raw"] = decode_mcp_response(response_body, response.headers.get("Content-Type", ""))
+                raise ValueError("Grep response exceeded the 4 MiB response limit.")
+            receipt["raw"] = decode_grep_app_response(response_body, response.headers.get("Content-Type", ""))
         receipt["results"] = parse_grep_search_results(receipt["raw"])
     except HTTPError as error:
         receipt["status"] = "error"
@@ -325,13 +358,18 @@ def search_grep_app(term: str, ca_bundle_path: str | None = None) -> dict[str, A
 
 
 def resolve_public_repository_commit(repository: str) -> str:
-    """Resolve the current default-branch commit after verifying public visibility.
+    """Look up a public repository's current default-branch commit on GitHub.
+
+    First request repository metadata and reject private or unknown visibility.
+    Then request the default branch's current commit. Callers use that commit
+    identifier in ZIP download URLs so later branch changes do not change the
+    source files being scanned.
 
     Args:
-        repository: GitHub repository identifier with an optional host prefix.
+        repository: ``owner/repository`` or ``github.com/owner/repository``.
 
     Returns:
-        The full commit SHA for a currently public repository's default branch.
+        The lowercase 40-character Git commit hash.
 
     Raises:
         ValueError: If the repository name is unsafe.

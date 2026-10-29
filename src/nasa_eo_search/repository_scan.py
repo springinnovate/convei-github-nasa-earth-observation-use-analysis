@@ -1,4 +1,9 @@
-"""Search bounded repository snapshots without extracting or executing their files."""
+"""Find dataset identifiers in the text files of a downloaded repository ZIP.
+
+Files are read directly from the ZIP, never extracted or executed. Callers set
+the maximum file size, total decompressed bytes, and number of files to inspect;
+every excluded file is listed in the returned scan result.
+"""
 
 from collections import deque
 from functools import lru_cache
@@ -16,18 +21,23 @@ MATCHING_RULE = "literal; ASCII case-insensitive; ASCII non-alphanumeric boundar
 
 @lru_cache(maxsize=1)
 def build_literal_term_matcher(terms: tuple[str, ...]) -> tuple:
-    """Compile many literal terms into a reusable single-pass search automaton.
+    """Build a matcher that can find all catalog terms in one pass over a line.
 
-    The failure links allow all terms to be searched together, rather than
-    scanning each file once for every catalog term. Only the most recently used
-    catalog is cached. Letter normalization preserves character positions.
+    Call this once for a set of dataset identifiers, then pass the result to
+    ``find_literal_terms_in_line`` for each source line. The matcher uses the
+    Aho-Corasick algorithm to share work between overlapping terms instead of
+    searching the whole line separately for every term. Only the latest set of
+    terms is cached. Only ASCII letters are lowercased, so source offsets stay
+    unchanged even when the line contains Unicode characters.
 
     Args:
-        terms: Validated, unique catalog terms in their original spelling.
+        terms: Nonempty literal identifiers in their original spelling, checked
+            by ``scan_repository_zip`` before this function is called.
 
     Returns:
-        Transition dictionaries, failure links, terminal terms, and terminal
-        suffix links for an Aho-Corasick multi-pattern matcher.
+        A tuple of character transitions, fallback states, completed terms,
+        and links to matching suffixes. This is the ``matcher`` argument for
+        ``find_literal_terms_in_line``; callers do not need to unpack it.
     """
     transitions: list[dict[str, int]] = [{}]
     failure_links = [0]
@@ -65,15 +75,19 @@ def build_literal_term_matcher(terms: tuple[str, ...]) -> tuple:
 
 
 def find_literal_terms_in_line(line: str, matcher: tuple) -> set[str]:
-    """Return all catalog terms with valid identifier boundaries in one line.
+    """Find catalog terms in one line, ignoring ASCII letter case.
+
+    Each match must touch a line edge or a character other than an ASCII letter
+    or digit on both sides. An underscore therefore separates identifiers:
+    ``ATL03`` matches ``ATL03_007`` but not ``MATL03`` or ``ATL030``.
 
     Args:
         line: Original decoded file line, without its newline terminator.
-        matcher: Automaton returned by ``build_literal_term_matcher``.
+        matcher: Search tables returned by ``build_literal_term_matcher``.
 
     Returns:
-        Original catalog terms present at least once in the line. For example,
-        ATL03 matches ``ATL03_007`` but not ``MATL03`` or ``ATL030``.
+        The set of matching terms in their original catalog spelling. A term
+        appears once in the set even if it occurs several times in the line.
     """
     transitions, failure_links, terminal_terms, terminal_suffix_links = matcher
     normalized_line = line.translate(ASCII_LOWERCASE)
@@ -97,15 +111,20 @@ def find_literal_terms_in_line(line: str, matcher: tuple) -> set[str]:
     return matching_terms
 
 
-def inspect_archive_member_path(member: zipfile.ZipInfo) -> tuple[list[str], str]:
-    """Validate a snapshot member before any of its contents are read.
+def inspect_zip_member_path(member: zipfile.ZipInfo) -> tuple[list[str], str]:
+    """Check a ZIP entry's path and file type before reading its contents.
+
+    Reject absolute paths, parent-directory components, Windows drive names,
+    control characters, symbolic links, and special files. The scanner and
+    classifier use this same check when opening a saved repository ZIP.
 
     Args:
-        member: Archive metadata, including the original unnormalized name.
+        member: ZIP entry metadata, including its original stored filename.
 
     Returns:
-        Safe POSIX path components and an empty reason, or empty components and
-        a reason identifying an unsafe path, link, or special-file entry.
+        A list of slash-separated path components and an empty reason when
+        accepted. Otherwise, an empty list and a reason such as
+        ``unsafe_archive_path`` or ``symbolic_link_not_followed``.
     """
     member_name = member.orig_filename
     if (
@@ -128,39 +147,44 @@ def inspect_archive_member_path(member: zipfile.ZipInfo) -> tuple[list[str], str
     return components, ""
 
 
-def scan_repository_archive(
-    archive_path: Path | str,
+def scan_repository_zip(
+    zip_path: Path | str,
     terms: list[str],
     max_file_bytes: int = 2_000_000,
     max_uncompressed_bytes: int = 200_000_000,
     max_files: int = 20_000,
 ) -> dict:
-    """Search a saved ZIP snapshot for all literal dataset identifiers together.
+    """Scan a repository ZIP for every supplied dataset identifier.
 
-    Call this after downloading a repository at a recorded commit. Members are
-    read in memory: nothing is extracted, imported, installed, or executed. A
-    common enclosing directory is removed from reported paths. Matching text
-    is preserved with one-based line numbers and is never silently truncated.
-    Any skipped file makes the result incomplete, including binary files,
-    non-UTF-8 text, large files, submodule contents, and Git Large File Storage
-    (LFS) objects represented only by pointers.
+    Call this after downloading a ZIP for a recorded Git commit. It reads text
+    files directly from the ZIP, searches all terms together, and returns each
+    matching line with its original text and one-based line number. It does not
+    extract files or execute code. If all entries share a top-level directory,
+    that directory is removed from reported file paths.
+
+    The result lists files excluded because of unsafe names, unreadable content,
+    unsupported encoding, or the supplied resource limits. Git Large File
+    Storage (LFS) pointer files and submodule contents are also reported as
+    missing source content. Any exclusion makes the scan ``incomplete``.
 
     Args:
-        archive_path: Existing ZIP snapshot to inspect.
+        zip_path: Path to the downloaded repository ZIP.
         terms: Nonempty literal strings; newlines and NUL characters are invalid.
         max_file_bytes: Maximum uncompressed bytes read from any individual file.
         max_uncompressed_bytes: Aggregate maximum uncompressed bytes read.
         max_files: Maximum number of nondirectory entries considered for reading.
 
     Returns:
-        A dictionary containing one match per file and term, all matching lines,
-        scan metrics, explicit skipped-file reasons, and a complete or incomplete
-        status. Completeness describes only this saved snapshot, not discovery
-        coverage, other branches, history, or data downloaded by the code.
+        A dictionary with ``matches`` grouped by file and term, ``skipped``
+        entries with reasons, file/byte counts, and a ``complete`` or
+        ``incomplete`` status. Complete means this ZIP was scanned without
+        exclusions; it says nothing about other repositories, branches, history,
+        or data that the code would download when run. A malformed ZIP returns
+        ``incomplete`` with an ``invalid_archive`` reason.
 
     Raises:
         ValueError: Terms or resource limits are invalid.
-        OSError: The archive cannot be opened or its metadata cannot be read.
+        OSError: The ZIP file cannot be opened or its metadata cannot be read.
     """
     for limit_name, limit_value in (
         ("max_file_bytes", max_file_bytes),
@@ -175,28 +199,28 @@ def scan_repository_archive(
         raise ValueError("Search terms must be nonempty strings without newlines or NUL characters.")
     unique_terms = tuple(dict.fromkeys(terms))
     matcher = build_literal_term_matcher(unique_terms)
-    snapshot_path = Path(archive_path)
+    repository_zip_path = Path(zip_path)
     result = {
         "status": "complete", "matches": [], "skipped": [],
         "files_scanned": 0, "files_considered": 0, "bytes_scanned": 0,
         "bytes_read": 0, "uncompressed_bytes_budget_used": 0,
-        "archive_bytes": snapshot_path.stat().st_size,
+        "archive_bytes": repository_zip_path.stat().st_size,
         "declared_uncompressed_bytes": 0, "term_count": len(unique_terms),
         "matching_rule": MATCHING_RULE, "archive_root": "",
         "limits": {"max_file_bytes": max_file_bytes,
                    "max_uncompressed_bytes": max_uncompressed_bytes, "max_files": max_files},
     }
     try:
-        repository_archive = zipfile.ZipFile(snapshot_path)
+        repository_zip = zipfile.ZipFile(repository_zip_path)
     except zipfile.BadZipFile as error:
         result["status"] = "incomplete"
         result["skipped"].append({"file": "", "reason": "invalid_archive", "detail": str(error)})
         return result
 
-    with repository_archive:
-        archive_members = repository_archive.infolist()
+    with repository_zip:
+        zip_members = repository_zip.infolist()
         inspected_members = [
-            (member, *inspect_archive_member_path(member)) for member in archive_members
+            (member, *inspect_zip_member_path(member)) for member in zip_members
         ]
         safe_paths = [components for _, components, reason in inspected_members if not reason]
         common_roots = {components[0] for components in safe_paths}
@@ -240,7 +264,7 @@ def scan_repository_archive(
             # reads must not bypass the aggregate decompression budget.
             result["uncompressed_bytes_budget_used"] += member.file_size
             try:
-                with repository_archive.open(member) as input_file:
+                with repository_zip.open(member) as input_file:
                     file_bytes = input_file.read(member.file_size)
             except (zipfile.BadZipFile, RuntimeError, NotImplementedError, OSError, EOFError, zlib.error) as error:
                 result["skipped"].append({"file": file_path, "reason": "archive_member_read_error", "detail": str(error)})

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from nasa_eo_search.evidence_context import build_evidence_packets, enrich_evidence_group, make_line_evidence
 from nasa_eo_search.evidence_inputs import serialize_evidence
 from nasa_eo_search.evidence_notebooks import decode_notebook_source_cells
+from nasa_eo_search.evidence_packaging import reassemble_evidence_lines
 
 
 def make_evidence_group(file_name: str = "example.py") -> dict:
@@ -48,6 +49,32 @@ def add_fixture_lines(group: dict, lines: list[tuple[int, str]], kind: str, file
 
 class EvidencePackagingTests(unittest.TestCase):
     """Verify that smaller inputs preserve relevant evidence and audit locations."""
+
+    def test_snapshot_excerpts_are_retained_without_false_whole_line_conflicts(self) -> None:
+        """Keep excerpt text and IDs while excluding it from whole-line checks."""
+        group = make_evidence_group()
+        add_fixture_lines(group, [(2, "ATL03")], "matching_line")
+        first_excerpt = {**group["evidence"][0], "character_offset": 0}
+        second_excerpt = {**first_excerpt, "text": " tail", "character_offset": 5,
+                          "evidence_id": "second-excerpt"}
+        excerpts = [first_excerpt, second_excerpt]
+        original_excerpts = deepcopy(excerpts)
+        for marker in ("excerpt", "character_offset"):
+            with self.subTest(marker=marker):
+                matching_lines = [
+                    {"line_number": 2, "text": excerpt["text"],
+                     marker: True if marker == "excerpt" else excerpt["character_offset"]}
+                    for excerpt in excerpts
+                ]
+                matching_files = [{**group["files"][0], "matching_lines": matching_lines}]
+                assembled_lines = reassemble_evidence_lines(excerpts, matching_files)
+                self.assertEqual(len(assembled_lines), 1)
+                self.assertEqual(assembled_lines[0]["text"], "ATL03 tail")
+                self.assertEqual(assembled_lines[0]["character_offset"], 0)
+                self.assertEqual(assembled_lines[0]["source_ids"],
+                                 [first_excerpt["evidence_id"], "second-excerpt"])
+                self.assertNotIn("conflicting_fragments", assembled_lines[0])
+                self.assertEqual(excerpts, original_excerpts)
 
     def test_contiguous_lines_form_one_readable_block_with_raw_audit(self) -> None:
         """Keep the operation and its neighboring lines together with short IDs."""

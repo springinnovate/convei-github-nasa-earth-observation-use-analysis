@@ -32,9 +32,6 @@ A capped run exits 4; a run with errors exits 1. Either can retain usable result
 so inspect its tables and summary. Repeat the same command to resume.
 Add `--dry-run` to preview without network calls or writes.
 
-The [small live pilot](docs/github-snapshot-pilot.md) records measured search,
-resume, and classification results and their limits.
-
 After inspecting `github-pilot/matches.csv`, preview classification:
 
 ```console
@@ -168,25 +165,26 @@ nasa-eo search nasa-catalog --backend sourcegraph --short-name ATL03 --max-reque
 These retain their partitioned query, checkpoint, retry, and report behavior.
 `--all-hosts` and `--search-timeout` apply only to Sourcegraph. Schema-version-1
 outputs retain their original global-query strategy and reject partition-only
-controls. Changing backend requires a new directory. The
-[Sourcegraph trial](docs/search-reliability-trial.md) records scope-dependent misses.
+controls. Changing backend requires a new directory. Sourcegraph's global and
+repository-specific searches can cover different repositories; a successful
+query does not establish that every public repository was searched.
 
 ## 3. Classify saved files
 
 Input is a saved search **directory**, not a CSV. GitHub snapshot searches and
 existing Sourcegraph searches use the same classification command/categories.
-Standalone `discovery_trial` comparison directories have a different format
-and are not classification inputs.
 
 GitHub classification uses bounded matching and nearby code from the saved,
 verified revision, without re-downloading public context. Sourcegraph
 classification normally fetches nearby code at the recorded commit and bounded
 README context. Other matched files are assessed separately; no code is executed.
 
-Snapshot evidence retains at most 12 matching windows and 12,000 text characters
-per dataset/file, including up to ten nearby lines. The same bounded evidence is
-used for CSV reporting and model preparation. Warnings disclose omissions; the
-full raw scan and archive remain available. This local evidence policy is fixed;
+For each dataset/file, the report keeps up to 12 excerpts containing matches,
+normally at most 600 characters each (up to 1,000 for long identifiers).
+It can also include up to ten lines before and after each selected matching
+line, with a combined limit of 12,000 text characters. The same excerpts feed
+the CSV and classifier. Warnings identify omitted text; the full scan results
+and ZIP remain available. These excerpt limits are fixed;
 `--context-lines` controls fetched Sourcegraph context only.
 
 | Category | What the supplied evidence establishes |
@@ -237,8 +235,10 @@ Git ignores `secrets/`, `secretes/`, and `*.key`, but these files are plaintext.
 Restrict access and never commit or paste the key. Already tracked files are not
 protected by ignore rules. Receipts do not contain credentials.
 
-CSV reports are quoted UTF-8 with a byte-order mark. Formula-like cells receive
-a `Text: ` prefix; raw JSON preserves original text. Copy tables before adding
+CSV reports are quoted UTF-8 with a byte-order mark. Cells that a spreadsheet
+could interpret as formulas receive a `Text: ` prefix so Excel or similar
+programs display them as text instead of calculating them. Saved JSON keeps the
+original values without that prefix. Copy tables before adding
 personal notes. Close a spreadsheet if it blocks report updates.
 
 Commands exit 0 on success/preview, 4 for incomplete/pending/blocked work,
