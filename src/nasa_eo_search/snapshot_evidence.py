@@ -105,7 +105,8 @@ def build_snapshot_excerpt_citation(repository: str, commit: str, file_path: str
         character_offset: Zero-based character position where text begins in
             that line. This counts Unicode characters, not encoded bytes.
         text: Unmodified contiguous text from the source line.
-        kind: "matching_line" for a match or "surrounding_code" for context.
+        kind: "matching_line" for a match, "surrounding_code" for nearby lines,
+            or "enclosing_code" for structural context added for classification.
 
     Returns:
         Dictionary containing the supplied location and text plus evidence_id,

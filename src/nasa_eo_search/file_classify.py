@@ -9,6 +9,7 @@ from typing import Any
 
 from nasa_eo_search.batch_files import COMPLETED_SEARCH, lock_batch_directory
 from nasa_eo_search.batch_plan import validate_saved_batch_plan
+from nasa_eo_search.classification_context import add_enclosing_classification_context, read_repository_classification_sources
 from nasa_eo_search.evidence_classify import run_prepared_classifications, select_classification_settings
 from nasa_eo_search.evidence_context import build_evidence_packets, enrich_evidence_group
 from nasa_eo_search.evidence_inputs import identify_evidence, read_evidence_json, read_product_evidence_groups, serialize_evidence
@@ -122,8 +123,9 @@ def build_file_classification_plan(
     """Build model-input packets for each dataset/file/commit match.
 
     For Sourcegraph matches, fetch nearby source lines and README context unless
-    ``offline`` is true. For GitHub matches, use the saved ZIP excerpts without
-    making context requests. Split each file's text and product metadata into
+    ``offline`` is true. For GitHub matches, read the saved ZIP without making
+    context requests. Add bounded enclosing code from the same pinned source
+    file when available. Split each file's text and product metadata into
     JSON packets that fit ``packet_bytes``. Do not include matches from another
     file in the same assessment. This function makes no model calls or writes.
 
@@ -131,9 +133,9 @@ def build_file_classification_plan(
         source_plan: Saved file matches grouped by repository and product, with
             catalog metadata and search-status warnings.
         offline: Use saved Sourcegraph lines without fetching public context.
-            GitHub matches always use their previously selected ZIP excerpts.
-        context_lines: Sourcegraph surrounding lines per match. Snapshot context
-            was selected when the readable search-table row was created.
+            GitHub matches always use their verified local ZIPs.
+        context_lines: Sourcegraph nearby lines per match, in addition to bounded
+            enclosing definitions. GitHub context has fixed text limits.
         packet_bytes: Maximum UTF-8 bytes of a serialized evidence packet,
             including file identity, but excluding the API request wrapper.
         ca_bundle: Optional certificate authority bundle for public downloads.
@@ -157,6 +159,8 @@ def build_file_classification_plan(
         "offline": offline, "context_lines": context_lines, "packet_bytes": packet_bytes,
     }
     download_cache: dict[str, Any] = {}
+    snapshot_repository = None
+    snapshot_sources: dict[str, list[str]] = {}
     for number, group in enumerate(plan["groups"], start=1):
         file_record = group["files"][0]
         print(f"[{number}/{len(plan['groups'])}] Gather {group['repository']} / {group['product']['short_name']} / "
@@ -166,8 +170,16 @@ def build_file_classification_plan(
             group["notebook_cells"] = []
             group["notebook_decoded_lines"] = []
             group["evidence_gaps"] = list(file_record["snapshot_warnings"])
+            if snapshot_repository != group["repository"]:
+                snapshot_sources = read_repository_classification_sources(source_plan, group["repository"])
+                snapshot_repository = group["repository"]
+            add_enclosing_classification_context(group, snapshot_sources[file_record["file"]])
         else:
             enrich_evidence_group(group, download_cache, offline, context_lines, ca_bundle)
+            cached_source = download_cache.get(identify_evidence([
+                group["repository"], file_record["commit"], file_record["file"]]), {})
+            if "text" in cached_source:
+                add_enclosing_classification_context(group, cached_source["text"].splitlines())
         file_scope = {
             "assessment_unit": "file", "assessment_file": file_record["file"],
             "assessment_commit": file_record["commit"],
@@ -198,11 +210,12 @@ def preview_file_classification_plan(plan: dict[str, Any], arguments: argparse.N
     Raises:
         ValueError: If the requested model or generated-token limit is invalid.
     """
-    settings = select_classification_settings(arguments.output.resolve(), arguments.model, arguments.max_output_tokens)
+    settings = select_classification_settings(
+        arguments.output.resolve(), arguments.model, arguments.max_output_tokens, plan["prompt_version"])
     packets = [packet for group in plan["groups"] for packet in group["packets"]]
     selected_packets = packets[:arguments.max_requests]
     request_bytes = sum(len(serialize_evidence(build_classification_request(
-        packet, settings["model"], settings["max_output_tokens"],
+        packet, settings["model"], settings["max_output_tokens"], plan["prompt_version"],
     )).encode("utf-8")) for packet in selected_packets)
     blocked_files = sum(not group["packets"] for group in plan["groups"])
     context_note = ("Evidence uses bounded excerpts and nearby code from saved pinned snapshots; no public context is fetched. "

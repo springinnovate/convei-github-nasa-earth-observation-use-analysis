@@ -174,26 +174,36 @@ query does not establish that every public repository was searched.
 Input is a saved search **directory**, not a CSV. GitHub snapshot searches and
 existing Sourcegraph searches use the same classification command/categories.
 
-GitHub classification uses bounded matching and nearby code from the saved,
+GitHub classification uses bounded matching and enclosing code from the saved,
 verified revision, without re-downloading public context. Sourcegraph
-classification normally fetches nearby code at the recorded commit and bounded
-README context. Other matched files are assessed separately; no code is executed.
+classification normally fetches nearby code at the recorded commit, adds bounded
+enclosing definitions when available, and includes bounded README context.
+Other matched files are assessed separately; no code is executed.
 
-For each dataset/file, the report keeps up to 12 excerpts containing matches,
+For each dataset/file in a GitHub snapshot, the report keeps up to 12 excerpts containing matches,
 normally at most 600 characters each (up to 1,000 for long identifiers).
 It can also include up to ten lines before and after each selected matching
-line, with a combined limit of 12,000 text characters. The same excerpts feed
-the CSV and classifier. Warnings identify omitted text; the full scan results
-and ZIP remain available. These excerpt limits are fixed;
+line, with a combined limit of 12,000 text characters. Classification retains
+these original excerpts and can add enclosing Python functions/classes or
+configuration blocks, including nearby uses of an identifier table or YAML
+anchor. Added code stays in the same file and revision, has source citations,
+and uses at most 6,000 additional characters within the combined 12,000-character
+limit. Unsupported or malformed files retain nearby context. Warnings identify
+omitted text; the full scan results and ZIP remain available. These limits are fixed;
 `--context-lines` controls fetched Sourcegraph context only.
 
 | Category | What the supplied evidence establishes |
 | --- | --- |
-| `direct_use` | Application/analysis code accesses, downloads, or processes the dataset. |
-| `supporting_software` | A library, tool, test, fixture, or worked example demonstrates support. |
+| `direct_use` | An analysis or end-user application consumes the dataset for its own result. |
+| `supporting_software` | A reusable library, service, adapter, processing tool, test, or worked example enables dataset access or processing. It may itself read or download data. |
 | `reference_only` | Relevant prose mentions the dataset without demonstrating code use. |
 | `unrelated` | The identifier clearly means something else. |
 | `unclear` | Evidence is insufficient, conflicting, or unfinished. |
+
+The classifier also receives catalog mappings for identifiers actually present
+in its evidence, including collection IDs, catalog versions, and NASA metadata
+links. These explain which dataset an identifier names; the code must still
+show its role. A collection ID alone does not establish data use.
 
 `classified-matches.csv` retains original match columns and adds `status`,
 `category`, `explanation`, `gpt_model`, `evidence_citations`, and `error`.
@@ -210,6 +220,8 @@ calls using saved evidence.
 Repeat the same classification command to resume. Frozen evidence and successful
 responses are reused. Keep the source search/catalog, model, and output-token
 settings unchanged. A changed search requires a new classification directory.
+Existing runs retain their saved prompt and inputs. Use a new `--output`
+directory to apply updated context packaging and category guidance.
 Failures or uncertain requests require `--retry-failed`; an interrupted request
 may already have incurred a charge.
 

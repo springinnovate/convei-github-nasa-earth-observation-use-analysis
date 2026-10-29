@@ -192,7 +192,7 @@ def main(argument_values: list[str] | None = None) -> int:
     classify.add_argument("--catalog", type=Path, help="source catalog if it has moved; otherwise use its saved location")
     classify.add_argument("--model", required=True, help="GPT model supporting Responses structured outputs")
     classify.add_argument("--api-key-file", type=Path, help="key file; default lookup includes ./secrets/openai.key")
-    classify.add_argument("--offline", action="store_true", help="use saved snippets without downloading surrounding code; GPT calls still occur")
+    classify.add_argument("--offline", action="store_true", help="use saved evidence without public-code downloads; GPT calls still occur")
     classify.add_argument("--dry-run", action="store_true", help="preview without downloads, API calls, key reads, or writes")
     classify.add_argument("--max-requests", type=int, help="optional new-call limit; by default process all planned files")
     classify.add_argument("--retry-failed", action="store_true", help="explicitly retry failed/uncertain requests; may incur another charge")

@@ -1,10 +1,114 @@
 """Build compact, lossless matched-code packets with a separate provenance audit."""
 
 from collections import defaultdict
+import re
 from typing import Any
+from urllib.parse import quote
 
 from nasa_eo_search.evidence_inputs import serialize_evidence
 from nasa_eo_search.evidence_notebooks import decode_saved_notebook_line
+
+
+MAXIMUM_IDENTIFIER_TERMS = 32
+MAXIMUM_SOURCES_PER_IDENTIFIER = 8
+
+
+def find_identifier_occurrences(term: str, text: str) -> list[tuple[int, int]]:
+    """Locate complete catalog identifiers using the searcher's token boundaries.
+
+    Args:
+        term: Literal catalog identifier, rather than a regular expression.
+        text: Saved source text to inspect without changing its characters.
+
+    Returns:
+        Character ranges for case-insensitive matches with no adjacent ASCII
+        letter or digit. Underscores separate identifiers, as in dataset filenames.
+    """
+    return [(match.start(), match.end()) for match in re.finditer(
+        r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])", text,
+        flags=re.IGNORECASE | re.ASCII,
+    )] if term else []
+
+
+def collect_matched_identifier_mappings(group: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Explain identifiers present in matches using this product's saved catalog.
+
+    Args:
+        group: Repository/product group with raw matching lines and catalog
+            candidate signatures. Collection records must belong to this product.
+
+    Returns:
+        Sorted catalog mappings and the count of omitted provenance sources per
+        identifier. At most eight distinct collection sources are retained for
+        each term; every eligible matched term retains a mapping. These records
+        describe catalog identity and never receive code-evidence citation IDs.
+
+    Raises:
+        ValueError: If more than 32 catalog identifiers occur in matching lines.
+    """
+    product = group["product"]
+    matching_lines = reassemble_evidence_lines(
+        [item for item in group["evidence"] if item["kind"] == "matching_line"], group.get("files"),
+    )
+    collections_by_concept = {collection.get("concept_id"): collection
+                              for collection in product.get("collections", []) if collection.get("concept_id")}
+    sources_by_term: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = defaultdict(dict)
+    for signature in product.get("candidate_signatures", []):
+        term = signature.get("term", "")
+        if not term or not any(find_identifier_occurrences(term, line["text"]) for line in matching_lines):
+            continue
+        for source in signature.get("sources", []):
+            concept_id = source.get("concept_id")
+            collection = collections_by_concept.get(concept_id)
+            source_field = source.get("source_field")
+            if not collection or source_field not in {"id", "entry_id", "short_name"}:
+                continue
+            catalog_value = {"id": concept_id, "entry_id": collection.get("entry_id"),
+                             "short_name": product["short_name"]}[source_field]
+            if not isinstance(catalog_value, str) or catalog_value.casefold() != term.casefold():
+                continue
+            catalog_version = collection.get("version") or ""
+            sources_by_term[term][(source_field, concept_id, catalog_version)] = {
+                "term": term, "source_field": source_field, "concept_id": concept_id,
+                "catalog_version": catalog_version,
+                "catalog_url": f"https://cmr.earthdata.nasa.gov/search/concepts/{quote(concept_id, safe='')}.json",
+            }
+    if len(sources_by_term) > MAXIMUM_IDENTIFIER_TERMS:
+        raise ValueError("More than 32 matched catalog identifiers require mappings; prepare a smaller evidence group.")
+    mappings = []
+    omitted_sources = {}
+    for term, sources in sorted(sources_by_term.items()):
+        ordered_sources = [source for _, source in sorted(sources.items())]
+        mappings.extend(ordered_sources[:MAXIMUM_SOURCES_PER_IDENTIFIER])
+        if len(ordered_sources) > MAXIMUM_SOURCES_PER_IDENTIFIER:
+            omitted_sources[term] = len(ordered_sources) - MAXIMUM_SOURCES_PER_IDENTIFIER
+            group["packaging_notes"].append(
+                f"Catalog mapping for {term!r} includes eight collection sources; "
+                f"{omitted_sources[term]} additional sources remain in the saved product catalog."
+            )
+    return mappings, omitted_sources
+
+
+def filter_packet_identifier_mappings(packet: dict[str, Any]) -> dict[str, Any]:
+    """Keep catalog mappings only for complete identifiers in this packet's code.
+
+    Args:
+        packet: Finished packet whose shared metadata may describe other packets.
+
+    Returns:
+        A new packet with product metadata filtered to identifiers actually
+        visible in its evidence. Source text and saved product records are intact.
+    """
+    product = packet["product"]
+    if "matched_identifiers" not in product:
+        return packet
+    mappings = [mapping for mapping in product["matched_identifiers"]
+                if any(find_identifier_occurrences(mapping["term"], block["text"])
+                       for block in packet["evidence"])]
+    included_terms = {mapping["term"] for mapping in mappings}
+    return {**packet, "product": {**product, "matched_identifiers": mappings,
+            "identifier_sources_omitted": {term: count for term, count in product["identifier_sources_omitted"].items()
+                                           if term in included_terms}}}
 
 
 def separate_conflicting_line_fragments(
@@ -120,7 +224,8 @@ def build_readable_evidence_blocks(group: dict[str, Any]) -> list[dict[str, Any]
         group: Enriched repository/product group; raw evidence is never modified.
 
     Returns:
-        Readable matched-code blocks with deterministic short citation IDs.
+        Readable matching and explicitly selected enclosing-code blocks with
+        deterministic short citation IDs. Enclosing code keeps its context kind.
         Material notebook decoding limitations are added to evidence_gaps.
     """
     lines = reassemble_evidence_lines(group["evidence"], group.get("files"))
@@ -146,7 +251,7 @@ def build_readable_evidence_blocks(group: dict[str, Any]) -> list[dict[str, Any]
             if line["kind"] == "matching_line":
                 gaps.add(f"{line['file']}: saved notebook fragments do not establish complete cell boundaries; "
                          "source, outputs, and metadata may be mixed. Raw evidence is retained.")
-        identity = (line["file"], line["commit"], representation)
+        identity = (line["file"], line["commit"], representation, line["kind"] == "enclosing_code")
         if (current_block is None or identity != current_block["identity"]
                 or line["line_number"] != current_block["end_line"] + 1
                 or line["character_offset"] != 0):
@@ -174,7 +279,7 @@ def build_readable_evidence_blocks(group: dict[str, Any]) -> list[dict[str, Any]
     deduplicated = {}
     for block in sorted(blocks, key=lambda item: (item["file"], item["commit"] or "", item["line_number"], item.get("cell_index", -1))):
         block.pop("identity", None)
-        if block["kind"] != "matching_line":
+        if block["kind"] not in {"matching_line", "enclosing_code"}:
             group["packaging_notes"].append("Context outside matched blocks or decoded notebook cells is retained in raw audit evidence only.")
             continue
         identity = (block["text"], block["kind"], block.get("cell_type"), block["representation"])
@@ -194,8 +299,12 @@ def compact_product_description(group: dict[str, Any]) -> dict[str, Any]:
         group: Group whose full catalog product remains unchanged in the audit.
 
     Returns:
-        Product identity, one bounded description, and all known catalog versions.
-        Selected or shortened descriptions are disclosed in packaging_notes.
+        Product identity, a title of at most 300 characters, a description of at
+        most 1000 characters, and saved versions and matched-identifier mappings.
+        Shortened descriptions and omitted mapping sources are disclosed.
+
+    Raises:
+        ValueError: If more than 32 distinct matched identifiers need mappings.
     """
     product = group["product"]
     collections = product.get("collections", [])
@@ -207,12 +316,20 @@ def compact_product_description(group: dict[str, Any]) -> dict[str, Any]:
         group["packaging_notes"].append("Model input uses one catalog title/description for the product family; all collections remain in the audit.")
     if len(title) > 300 or len(description) > 1000:
         group["packaging_notes"].append("Model product title/description is limited to 300/1000 characters; complete metadata remains in the audit.")
+    matched_identifiers, omitted_sources = collect_matched_identifier_mappings(group)
     return {
         "provider": product["provider"], "short_name": product["short_name"],
         "title": title[:300], "description": description[:1000],
         "description_truncated": len(title) > 300 or len(description) > 1000,
         "catalog_versions": sorted({collection["version"] for collection in collections if collection.get("version")}),
         "classification_scope": "Product family across versions; catalog versions are not a compatibility requirement.",
+        "matched_identifiers": matched_identifiers,
+        "identifier_sources_omitted": omitted_sources,
+        "identifier_relationship_note": (
+            "These saved NASA Common Metadata Repository mappings link identifiers in the supplied code "
+            "to this product family. They establish dataset identity, not code use or version compatibility; "
+            "cite code evidence for the classification. Up to eight collection sources per identifier are shown."
+        ),
     }
 
 
@@ -286,8 +403,9 @@ def slice_evidence_block(
         matching_source_ids: Raw evidence identifiers established as search matches.
 
     Returns:
-        Fragment with narrowed locations and surrounding_code status when it
-        contains only mapped context. Text offset mappings remain audit-visible.
+        Fragment with narrowed source locations. Context fragments retain their
+        enclosing_code kind or receive surrounding_code status; neither becomes
+        a search match. Text offset mappings remain available in the audit.
     """
     fragment = {**block, "evidence_id": f"{block['evidence_id']}.{fragment_number}",
                 "text_offset": offset, "text": block["text"][offset:offset + length]}
@@ -311,7 +429,8 @@ def slice_evidence_block(
     for name in ("line_number", "end_line", "source_line_map"):
         if name in locations[0]:
             fragment[name] = locations[0][name]
-    fragment["kind"] = "matching_line" if matching_source_ids.intersection(fragment["source_ids"]) else "surrounding_code"
+    fragment["kind"] = ("matching_line" if matching_source_ids.intersection(fragment["source_ids"])
+                        else "enclosing_code" if block["kind"] == "enclosing_code" else "surrounding_code")
     return fragment
 
 
@@ -334,6 +453,8 @@ def split_evidence_block(
     """
     if measure_packet_bytes({**metadata, "evidence": [compact_evidence_block(block)]}) <= maximum_bytes:
         return [block]
+    identifier_ranges = sorted({occurrence for mapping in metadata["product"].get("matched_identifiers", [])
+                                for occurrence in find_identifier_occurrences(mapping["term"], block["text"])})
     pieces = []
     offset = 0
     while offset < len(block["text"]):
@@ -345,8 +466,15 @@ def split_evidence_block(
                 lower = midpoint
             else:
                 upper = midpoint - 1
+        # A split inside a catalog identifier would hide the complete identifier
+        # from both packets and remove its mapping during per-packet filtering.
+        # Leave that whole identifier for the next fragment instead.
+        for identifier_start, identifier_end in reversed(identifier_ranges):
+            if identifier_start < offset + lower < identifier_end:
+                lower = max(0, identifier_start - offset)
         if lower == 0:
-            raise ValueError("Product metadata or source locations exceed --packet-bytes; increase it and prepare a new directory.")
+            raise ValueError("Product metadata, complete matched identifier, or source locations exceed --packet-bytes; "
+                             "increase it and prepare a new directory.")
         pieces.append(slice_evidence_block(block, offset, lower, len(pieces) + 1, matching_source_ids))
         offset += lower
     if not pieces:
@@ -394,4 +522,4 @@ def package_evidence_blocks(group: dict[str, Any], max_packet_bytes: int) -> lis
     if current_packet["evidence"]:
         packets.append(current_packet)
     group["packaging_notes"] = sorted(set(group["packaging_notes"]))
-    return packets
+    return [filter_packet_identifier_mappings(packet) for packet in packets]
