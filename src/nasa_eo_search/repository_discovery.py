@@ -1,9 +1,11 @@
-"""Find public GitHub files through GitHub code search and grep.app.
+"""Discover public GitHub repositories through code and repository searches.
 
 The search command uses these functions for both small samples and larger runs;
 page limits are arguments, not a separate trial implementation. GitHub requests
-use the user's GitHub CLI login. grep.app requests use its public Model Context
-Protocol (MCP) endpoint, which accepts a JSON tool call and returns search text.
+use the user's GitHub CLI login. Repository searches use names, descriptions,
+and README files; code searches and grep.app return candidate file locations.
+grep.app requests use its public Model Context Protocol (MCP) endpoint, which
+accepts a JSON tool call and returns search text.
 """
 
 from __future__ import annotations
@@ -29,6 +31,12 @@ PUBLIC_SEARCH_FILTER = (
     'items: [.items[] | select(.repository.private == false) | '
     '{path, html_url, sha, repository: {full_name: .repository.full_name, private: false}, '
     'text_matches: [.text_matches[]? | {property, fragment}]}]}'
+)
+PUBLIC_REPOSITORY_SEARCH_FILTER = (
+    '{total_count, incomplete_results, '
+    'omitted_nonpublic: ([.items[] | select(.private != false)] | length), '
+    'items: [.items[] | select(.private == false) | '
+    '{full_name, private: false, html_url, fork, archived, size, stargazers_count}]}'
 )
 
 
@@ -144,7 +152,8 @@ def search_github_code(term: str, max_pages: int = 1, *, start_page: int = 1) ->
         raise ValueError("max_pages must be an integer between 1 and 10.")
     if type(start_page) is not int or start_page < 1 or start_page + max_pages - 1 > 10:
         raise ValueError("Requested GitHub pages must stay between 1 and 10.")
-    query = f'"{term}" in:file fork:true'
+    quoted_term = term.replace("\\", "\\\\")
+    query = f'"{quoted_term}" in:file fork:true'
     started_at = time.monotonic()
     receipt: dict[str, Any] = {
         "provider": "github", "term": term, "query": query, "status": "returned",
@@ -204,6 +213,132 @@ def search_github_code(term: str, max_pages: int = 1, *, start_page: int = 1) ->
                 receipt["status"] = "incomplete"
                 receipt["warnings"].append("GitHub reported incomplete_results=true.")
             if page["total_count"] <= page_number * 100:
+                break
+            if page_number == start_page + max_pages - 1:
+                if receipt["status"] != "incomplete":
+                    receipt["status"] = "capped"
+                receipt["warnings"].append(
+                    f"Stopped after page {page_number}; more hits exist and GitHub exposes at most 1,000 per query."
+                )
+    except RuntimeError as error:
+        receipt["status"] = "error"
+        receipt["warnings"].append(str(error))
+    receipt["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+    return receipt
+
+
+def search_github_repositories(term: str, max_pages: int = 1, *, start_page: int = 1) -> dict[str, Any]:
+    """Discover public repositories through their names, descriptions, and READMEs.
+
+    Use this alongside code search to discover candidates on a complementary
+    GitHub index. Results identify repositories, not verified matching files;
+    the saved snapshot scan establishes file evidence later. GitHub CLI supplies
+    authentication. Requests share code search's conservative 6.1-second spacing.
+    Nonpublic results are removed by CLI filtering and checked again in Python.
+
+    Args:
+        term: Dataset identifier or reviewed alias to send as a quoted term.
+        max_pages: Maximum 100-result pages, from one through ten.
+        start_page: First page to request without repeating earlier saved pages.
+            The requested range cannot extend beyond page ten.
+
+    Returns:
+        A receipt with query, results, sanitized raw pages, metadata, and status.
+        Each result has an empty file field and the repository's public URL.
+        Status is returned, capped, incomplete, or error; earlier public results
+        survive later failures. Malformed public items are omitted and disclosed.
+        Neither a hit nor a returned status establishes dataset use or complete
+        coverage of GitHub repositories.
+
+    Raises:
+        ValueError: The search term or requested page bounds are invalid.
+    """
+    global _last_github_search_started
+    validate_search_term(term)
+    if type(max_pages) is not int or not 1 <= max_pages <= 10:
+        raise ValueError("max_pages must be an integer between 1 and 10.")
+    if type(start_page) is not int or start_page < 1 or start_page + max_pages - 1 > 10:
+        raise ValueError("Requested GitHub pages must stay between 1 and 10.")
+    # A backslash could escape the closing quote and turn text into qualifiers.
+    quoted_term = term.replace("\\", "\\\\")
+    query = f'"{quoted_term}" in:name,description,readme is:public fork:true'
+    started_at = time.monotonic()
+    receipt: dict[str, Any] = {
+        "provider": "github-repositories", "term": term, "query": query,
+        "status": "returned", "results": [], "raw": [], "start_page": start_page,
+        "pages_returned": 0, "has_more": False,
+        "warnings": [
+            "Repository discovery searches names, descriptions, and READMEs; local scanning establishes file matches.",
+            "GitHub ranking, pagination, and index coverage limit discovery; repository hits do not establish dataset use.",
+            "Raw pages are sanitized to public repositories only; total_count can include discarded nonpublic hits.",
+        ],
+    }
+    seen_repositories: set[str] = set()
+    try:
+        for page_number in range(start_page, start_page + max_pages):
+            if _last_github_search_started is not None:
+                time.sleep(max(0.0, 6.1 - (time.monotonic() - _last_github_search_started)))
+            _last_github_search_started = time.monotonic()
+            page = run_github_json([
+                "--method", "GET", "search/repositories", "-f", f"q={query}",
+                "-f", "per_page=100", "-f", f"page={page_number}",
+                "-H", "Accept: application/vnd.github+json",
+                "--jq", PUBLIC_REPOSITORY_SEARCH_FILTER,
+            ])
+            if not isinstance(page, dict) or not isinstance(page.get("items"), list):
+                raise RuntimeError("GitHub returned an unexpected repository-search response.")
+            if (type(page.get("total_count")) is not int or page["total_count"] < 0
+                    or type(page.get("incomplete_results")) is not bool
+                    or type(page.get("omitted_nonpublic", 0)) is not int
+                    or page.get("omitted_nonpublic", 0) < 0):
+                raise RuntimeError("GitHub omitted valid repository-search completion metadata.")
+            sanitized_items = []
+            omitted_nonpublic = page.get("omitted_nonpublic", 0)
+            omitted_malformed = 0
+            for item in page["items"]:
+                if not isinstance(item, dict) or item.get("private") is not False:
+                    omitted_nonpublic += 1
+                    continue
+                try:
+                    repository_name = validate_repository_name(item.get("full_name", ""))
+                except (ValueError, AttributeError):
+                    omitted_malformed += 1
+                    continue
+                repository_url = f"https://github.com/{repository_name}"
+                if (item.get("html_url") != repository_url
+                        or any(type(item.get(field)) is not bool for field in ("fork", "archived"))
+                        or any(type(item.get(field)) is not int or item[field] < 0
+                               for field in ("size", "stargazers_count"))):
+                    omitted_malformed += 1
+                    continue
+                sanitized_items.append({
+                    "full_name": repository_name, "private": False, "html_url": repository_url,
+                    "fork": item["fork"], "archived": item["archived"],
+                    "size": item["size"], "stargazers_count": item["stargazers_count"],
+                })
+                repository_identity = repository_name.lower()
+                if repository_identity not in seen_repositories:
+                    seen_repositories.add(repository_identity)
+                    receipt["results"].append({
+                        "repository": f"github.com/{repository_name}", "file": "", "url": repository_url,
+                        "repository_metadata": {"fork": item["fork"], "archived": item["archived"],
+                                                "size_kb": item["size"], "stars": item["stargazers_count"]},
+                    })
+            receipt["raw"].append({
+                "total_count": page["total_count"], "incomplete_results": page["incomplete_results"],
+                "omitted_nonpublic": omitted_nonpublic, "omitted_malformed": omitted_malformed,
+                "items": sanitized_items,
+            })
+            receipt["total_count"] = page["total_count"]
+            receipt["pages_returned"] += 1
+            receipt["has_more"] = page["total_count"] > page_number * 100
+            if page["incomplete_results"] or omitted_malformed:
+                receipt["status"] = "incomplete"
+                if page["incomplete_results"]:
+                    receipt["warnings"].append("GitHub reported incomplete_results=true.")
+                if omitted_malformed:
+                    receipt["warnings"].append(f"Omitted {omitted_malformed} public repository results with malformed metadata.")
+            if not receipt["has_more"]:
                 break
             if page_number == start_page + max_pages - 1:
                 if receipt["status"] != "incomplete":

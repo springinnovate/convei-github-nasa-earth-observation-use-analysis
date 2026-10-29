@@ -19,15 +19,16 @@ gh auth login
 ```
 
 Search uses that login without copying a GitHub token into this project. Only
-confirmed-public results are saved. Search and local scanning make no GPT calls.
+confirmed-public results are saved. Default discovery and local scanning make no
+GPT calls. Optional web discovery makes paid OpenAI requests.
 
 If you already have the saved `nasa-catalog` directory, start a small run:
 
 ```console
-nasa-eo search nasa-catalog --short-name ATL03 --short-name ARIA_S1_GUNW --short-name ASF_ECMWF_SMST --github-pages 2 --max-repositories 3 --max-archive-mb 25 --max-total-mb 75 --max-requests 5 --output github-pilot
+nasa-eo search nasa-catalog --short-name ATL03 --short-name ARIA_S1_GUNW --short-name ASF_ECMWF_SMST --github-pages 2 --max-repositories 3 --max-archive-mb 25 --max-total-mb 75 --max-requests 6 --output github-pilot
 ```
 
-This makes at most five discovery calls and attempts at most three snapshots.
+This makes at most six discovery calls and attempts at most three snapshots.
 A capped run exits 4; a run with errors exits 1. Either can retain usable results,
 so inspect its tables and summary. Repeat the same command to resume.
 Add `--dry-run` to preview without network calls or writes.
@@ -82,9 +83,19 @@ that time, not every NASA dataset. Partial catalogs retain their warnings.
 
 ## 2. Find repositories and scan their code
 
-New searches default to GitHub. Selected dataset short names are sent to code
-search to discover candidate repositories. Repositories are selected across
-queries up to the saved cap. No known examples are inserted automatically.
+New searches use both GitHub code search and repository search across names,
+descriptions, and READMEs. A repository-search hit identifies a candidate;
+the downloaded snapshot supplies actual file matches. Both sources count
+against `--max-requests` and have separate saved pages and completion statuses.
+
+Selection takes turns across datasets and search sources, beginning with web
+discovery when enabled, then repository search. It prefers distinct repository names, repositories not
+reported as forks, and repositories whose reported size does not exceed the
+archive-size limit. Reported size is a rough guide, not a ZIP-size guarantee;
+unknown sizes remain eligible. Deferred candidates fill otherwise unused slots.
+Matching repository names are a diversity heuristic, not proof of shared code.
+The selected order also determines download order. Existing selections remain
+fixed on resume, including failed downloads, and count toward the repository cap.
 
 Each selected public repository is downloaded at a recorded default-branch
 commit. The command then searches **all candidate identifiers in the saved
@@ -108,13 +119,70 @@ occurrences per dataset association under `identity_filtering`; raw scans and
 ZIPs retain the original text. This check depends on the saved catalog and does
 not resolve unknown aliases.
 
+To add discovery terms, create an optional UTF-8 CSV with these exact headers:
+
+```csv
+short_name,term,source_url
+MUR-JPL-L4-GLOB-v4.1,jplMURSST41,https://coastwatch.pfeg.noaa.gov/erddap/info/jplMURSST41/index.html
+```
+
+The [NOAA metadata](https://coastwatch.pfeg.noaa.gov/erddap/info/jplMURSST41/index.html)
+links this ERDDAP identifier to the NASA MUR product. Each CSV row must name a
+dataset in your catalog and provide an HTTPS source for the alias. Add
+`--discovery-aliases discovery-aliases.csv` to a new search. Canonical dataset
+names are queried before aliases; aliases share their dataset's selection queue.
+The selected rows and source URLs are frozen in the plan and shown in
+`searches.csv`. On resume, the CSV may be omitted; supplying changed aliases
+requires a new output directory.
+
+Discovery aliases broaden the candidate list only. Local scanning and
+classification still use the saved catalog identifiers. A repository found only
+through an alias can therefore have no local catalog matches; that does not
+establish absence of data use.
+
+### Optional web discovery
+
+Add `--web-search-model YOUR_MODEL` to a new GitHub search to include paid OpenAI
+web discovery. Use a model available to your API account that supports the
+[Responses web-search tool](https://developers.openai.com/api/docs/guides/tools-web-search).
+The key lookup uses `OPENAI_API_KEY`, then `./secrets/openai.key`; an explicit
+`--api-key-file PATH` takes precedence. Keys and key-file paths are not saved in
+the search plan. Dry runs and resumes with no new web work do not read a key.
+
+For each selected dataset, the command prepares an exact short-name query and,
+when the catalog has a useful title, a second query adding up to six title words.
+Both target `github.com`. The plan records the title, catalog provenance, model,
+and requested queries. Discovery aliases remain separate GitHub/grep.app terms.
+
+Each new web request counts toward `--max-requests` and allows at most two web
+tool calls and 2,000 output tokens. A tool call can contain multiple search
+strings; the response's actual queries are recorded separately and differences
+are flagged. Only URLs supplied by the web tool are accepted as candidates;
+model-written answers are not treated as evidence. Up to twenty candidate
+repositories per response are checked through GitHub for public visibility,
+with up to five source URLs retained per repository. Those metadata calls are
+additional to the discovery-call cap. The selected snapshot count remains
+bounded by `--max-repositories` across all discovery sources.
+
+Web discovery supplies a ranked sample without a total-count or pagination
+guarantee. It does not establish dataset use. The local scan and classification
+commands process the selected repositories as usual. Saved web responses are
+reused; `--retry-incomplete` can repeat failed, interrupted, or incomplete paid
+requests and may incur another charge. Completed limited samples are not retried
+automatically. Omit the model flag to reuse a saved setting; changing the model,
+queries, or enabling web search on an older run requires a fresh output directory.
+
 ### Bounds and resume
 
 | Option | New GitHub run behavior |
 | --- | --- |
 | `--short-name NAME` | Select discovery products; repeat for several. Without it, all catalog short names are planned, still subject to the invocation request cap. |
 | `--max-requests N` | At most N new discovery calls this invocation; default 10. Snapshot metadata/download calls are separate, bounded by the repository cap. |
-| `--github-pages N` | Maximum 100-result pages per term, 1–10; default 10. |
+| `--github-pages N` | Maximum 100-result pages per term and GitHub search source, 1–10; default 10. |
+| `--github-discovery code-and-readme` | Default for new runs; adds repository/README discovery. `code` uses only code search. |
+| `--discovery-aliases PATH` | Optional CSV of additional discovery terms and their source URLs. |
+| `--web-search-model MODEL` | Opt in to paid web discovery, one model request per selected canonical dataset; saved runs retain their setting. |
+| `--api-key-file PATH` | Explicit OpenAI key file for web discovery. Without it, use the environment or `./secrets/openai.key`. |
 | `--max-repositories N` | Maximum selected snapshots; default 6. |
 | `--max-archive-mb N` | Compressed download limit per snapshot; default 100 decimal MB. |
 | `--max-total-mb N` | Total retained snapshot download budget; default 300 decimal MB. Reports/catalog metadata need additional space. |
@@ -127,6 +195,9 @@ to continue; successful pages and verified snapshots are reused. Discovery calls
 are spaced to respect GitHub's code-search rate. A failure is saved, not silently
 treated as zero matches. Keep the catalog and frozen options unchanged; use a new
 directory to change fixed bounds. The request cap applies to each invocation.
+Older GitHub output directories retain code-only discovery and their original
+selection order. Choose a new output directory to use the combined search and
+diversity preference.
 
 Each ZIP scan reads at most 200 MB uncompressed, 20,000 files, and 2 MB per file.
 Binary, non-UTF-8, oversized, duplicate, unsafe, or unreadable entries are
@@ -138,8 +209,9 @@ are not downloaded.
 | Output | Contents |
 | --- | --- |
 | `matches.csv` | One row per dataset/repository/file/commit, combining matching terms and bounded snippets with source links. |
-| `searches.csv` | Query/page progress and limitations, including zero-result and unsuccessful searches. |
-| `repositories.csv` | Discovery provenance, selected/skipped repositories, pinned revisions, download and scan outcomes. |
+| `searches.csv` | Requested queries, actual web queries, model/token usage, dataset associations, alias sources, page progress, candidate repository/file counts, and limitations. Repository-only hits have zero candidate files. |
+| `discovery.csv` | Candidate repositories and discovery locations, including verified public source URLs for web results. File evidence comes from the local scan. |
+| `repositories.csv` | Discovery provenance, selection reasons/name groups, available public metadata, pinned revisions, download and scan outcomes. |
 | `summary.json` | Overall status, counts, and coverage warnings; fixed bounds are in `plan.json`. |
 | `plan.json`, `catalog.json`, `snapshots.json` | Frozen run choices, catalog metadata, and snapshot manifest. |
 | Saved discovery and snapshot files | Public-only search receipts, pinned archives, and full raw scan matches with checksums. |
@@ -162,6 +234,8 @@ repositories before saving; nonpublic hits can occupy part of a page. Current
 downloaded snapshots may differ from versions indexed by a service.
 `search_complete` stays false: no status or zero-hit query establishes exhaustive
 GitHub coverage or absence of NASA data use.
+The [repository-search qualifiers](https://docs.github.com/en/search-github/searching-on-github/searching-for-repositories)
+describe the additional index searched by `code-and-readme`.
 
 ### Existing Sourcegraph searches
 

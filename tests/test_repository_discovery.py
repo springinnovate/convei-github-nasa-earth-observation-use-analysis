@@ -68,6 +68,18 @@ class GitHubDiscoveryTests(unittest.TestCase):
         self.assertIn(repository_discovery.PUBLIC_SEARCH_FILTER, request.call_args.args[0])
 
     @patch("nasa_eo_search.repository_discovery.run_github_json")
+    def test_code_search_escapes_literal_backslashes_inside_quoted_term(self, request: Mock) -> None:
+        """Prevent a trailing backslash from escaping the code search phrase's closing quote.
+
+        Args:
+            request: Mock GitHub CLI request receiving the escaped literal query.
+        """
+        request.return_value = github_search_page()
+        receipt = repository_discovery.search_github_code("dataset\\")
+        self.assertEqual(receipt["query"], '"dataset\\\\" in:file fork:true')
+        self.assertIn('q="dataset\\\\" in:file fork:true', request.call_args.args[0])
+
+    @patch("nasa_eo_search.repository_discovery.run_github_json")
     def test_saved_pagination_can_request_one_later_page(self, request: Mock) -> None:
         """Request page two without repeating page one.
 

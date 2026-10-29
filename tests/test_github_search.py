@@ -30,6 +30,7 @@ def make_github_arguments(catalog: Path, output: Path, **overrides) -> argparse.
         "catalog": catalog, "output": output, "short_name": ["ATL03"], "dry_run": False,
         "max_requests": 10, "ca_bundle": None, "github_pages": 2, "max_repositories": 2,
         "max_archive_mb": 1, "max_total_mb": 2, "include_grep_app": False,
+        "github_discovery": "code", "discovery_aliases": None,
         "retry_incomplete": False, **overrides,
     })
 
