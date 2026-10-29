@@ -11,8 +11,8 @@ from nasa_eo_search.evidence_context import build_evidence_packets, enrich_evide
 from nasa_eo_search.evidence_credentials import load_openai_api_key
 from nasa_eo_search.evidence_inputs import identify_evidence, read_evidence_json, read_product_evidence_groups, serialize_evidence
 from nasa_eo_search.evidence_model import (
-    CLASSIFICATION_PROMPT, PROMPT_VERSION, build_classification_request,
-    parse_classification_response, request_evidence_classification,
+    CLASSIFICATION_PROMPTS, PROMPT_VERSION, build_classification_request,
+    parse_classification_response, request_evidence_classification, select_classification_prompt,
 )
 from nasa_eo_search.evidence_reports import (
     inspect_classification_receipts, load_evidence_plan, save_evidence_json, write_evidence_reports,
@@ -62,7 +62,7 @@ def prepare_classification_evidence(arguments: argparse.Namespace) -> int:
 
 
 def save_prepared_classification_plan(output_directory: Path, plan: dict[str, Any]) -> int:
-    """Save a new immutable v2 preparation and its credential-free review preview.
+    """Save a new immutable preparation and its credential-free review preview.
 
     Args:
         output_directory: New destination that must not already exist.
@@ -75,23 +75,29 @@ def save_prepared_classification_plan(output_directory: Path, plan: dict[str, An
         OSError: If creating or writing the destination fails.
         ValueError: If the prepared report cannot be generated.
     """
+    prompt_version = plan["prompt_version"]
+    instructions = select_classification_prompt(prompt_version)
+    is_file_plan = plan.get("assessment_unit") == "file"
     output_directory.mkdir(parents=True, exist_ok=False)
     with lock_batch_directory(output_directory):
         save_evidence_json(output_directory / "plan.json", {
-            "schema_version": 2, "plan_id": identify_evidence(plan), "data": plan,
+            "schema_version": 3 if is_file_plan else 2, "plan_id": identify_evidence(plan), "data": plan,
         })
-        save_evidence_json(output_directory / "prompt.json", {"version": PROMPT_VERSION, "instructions": CLASSIFICATION_PROMPT})
+        save_evidence_json(output_directory / "prompt.json", {"version": prompt_version, "instructions": instructions})
         summary = write_evidence_reports(output_directory, plan, None)
-    print(f"Prepared {summary['repository_product_groups']} repository/product groups, "
+    assessment_count = summary["file_matches"] if is_file_plan else summary["repository_product_groups"]
+    assessment_label = "file matches" if is_file_plan else "repository/product groups"
+    report_name = "classified-matches.csv" if is_file_plan else "review.csv"
+    print(f"Prepared {assessment_count} {assessment_label}, "
           f"{summary['planned_requests']} planned requests. No OpenAI calls made. "
-          f"Inspect {output_directory / 'review.csv'} and plan.json.", file=sys.stderr)
+          f"Inspect {output_directory / report_name} and plan.json.", file=sys.stderr)
     return 4 if summary["groups_by_status"]["blocked"] else 0
 
 
 def repack_saved_classification_evidence(arguments: argparse.Namespace) -> int:
-    """Repackage saved excerpts into a new v2 directory without network access.
+    """Repackage saved excerpts with current instructions without network access.
 
-    Use this to compare packaging on identical v1 or v2 source evidence. Original
+    Use this to compare packaging on identical v1, v2, or v3 source evidence. Original
     plans and paid responses remain untouched; changed requests cannot reuse old
     classifications. Missing notebook context stays a recorded limitation.
 
@@ -114,13 +120,19 @@ def repack_saved_classification_evidence(arguments: argparse.Namespace) -> int:
     envelope = read_evidence_json(source_directory / "plan.json")
     plan = envelope.get("data")
     schema_version = envelope.get("schema_version")
-    supported_versions = {1: "repository-product-v1", 2: PROMPT_VERSION}
+    supported_versions = {1: {"repository-product-v1"}, 2: set(CLASSIFICATION_PROMPTS), 3: set(CLASSIFICATION_PROMPTS)}
     if (type(schema_version) is not int or schema_version not in supported_versions
             or not isinstance(plan, dict)
-            or plan.get("prompt_version") != supported_versions[schema_version]
+            or not isinstance(plan.get("prompt_version"), str)
+            or plan["prompt_version"] not in supported_versions[schema_version]
             or envelope.get("plan_id") != identify_evidence(plan)
             or not isinstance(plan.get("groups"), list)):
         raise ValueError("Saved preparation is invalid, changed, or uses an unsupported version.")
+    if schema_version in (2, 3):
+        plan = load_evidence_plan(source_directory)
+    is_file_plan = plan.get("assessment_unit") == "file"
+    if is_file_plan and schema_version != 3:
+        raise ValueError("File assessments require schema version 3.")
     original_plan_id = envelope["plan_id"]
     source_packets = []
     seen_group_ids = set()
@@ -134,14 +146,20 @@ def repack_saved_classification_evidence(arguments: argparse.Namespace) -> int:
         expected_group_id = identify_evidence([
             group.get("repository"), group["product"].get("provider"),
             group["product"].get("short_name"),
-        ])
+        ] + ([group["files"][0]["file"], group["files"][0].get("commit")] if is_file_plan else []))
         if group.get("group_id") != expected_group_id or expected_group_id in seen_group_ids:
             raise ValueError("Saved preparation contains an invalid evidence group identity.")
         seen_group_ids.add(expected_group_id)
         source_packets.extend(group["packets"])
         group.pop("preparation_error", None)
+        file_scope = ({
+            "assessment_unit": "file", "assessment_file": group["files"][0]["file"],
+            "assessment_commit": group["files"][0].get("commit"),
+        } if is_file_plan else {})
+        scope_bytes = len(serialize_evidence(file_scope).encode("utf-8")) - 1 if is_file_plan else 0
         try:
-            group["packets"] = build_evidence_packets(group, arguments.packet_bytes)
+            packets = build_evidence_packets(group, arguments.packet_bytes - scope_bytes)
+            group["packets"] = [{**packet, **file_scope} for packet in packets]
         except ValueError as error:
             group["packets"] = []
             group["preparation_error"] = str(error)
@@ -163,13 +181,17 @@ def repack_saved_classification_evidence(arguments: argparse.Namespace) -> int:
     return result
 
 
-def select_classification_settings(output_directory: Path, model: str, max_output_tokens: int) -> dict[str, Any]:
+def select_classification_settings(
+    output_directory: Path, model: str, max_output_tokens: int,
+    prompt_version: str = PROMPT_VERSION,
+) -> dict[str, Any]:
     """Validate explicit model settings and preserve them across resumed runs.
 
     Args:
         output_directory: Prepared evidence directory.
         model: User-selected model identifier, never inferred from a default.
         max_output_tokens: Generated-token cap for each request.
+        prompt_version: Version frozen in the plan, or current for a new plan.
 
     Returns:
         Settings to persist before the first paid call.
@@ -182,7 +204,8 @@ def select_classification_settings(output_directory: Path, model: str, max_outpu
         raise ValueError("--model must be a nonempty model identifier without whitespace.")
     if not 256 <= max_output_tokens <= 32768:
         raise ValueError("--max-output-tokens must be between 256 and 32768.")
-    settings = {"model": model, "max_output_tokens": max_output_tokens, "prompt_version": PROMPT_VERSION}
+    select_classification_prompt(prompt_version)
+    settings = {"model": model, "max_output_tokens": max_output_tokens, "prompt_version": prompt_version}
     settings_path = output_directory / "settings.json"
     if settings_path.exists() and read_evidence_json(settings_path) != settings:
         raise ValueError("Model/output settings differ from this run; reuse the original settings or prepare a new directory.")
@@ -214,12 +237,12 @@ def run_prepared_classifications(arguments: argparse.Namespace) -> int:
     is_file_plan = plan.get("assessment_unit") == "file"
     if arguments.max_requests is not None and arguments.max_requests < 1:
         raise ValueError("--max-requests must be positive.")
-    settings = select_classification_settings(output_directory, arguments.model, arguments.max_output_tokens)
+    settings = select_classification_settings(output_directory, arguments.model, arguments.max_output_tokens, plan["prompt_version"])
     scheduled_requests = {}
     skipped_requests = 0
     for group in plan["groups"]:
         for packet in group["packets"]:
-            request_body = build_classification_request(packet, settings["model"], settings["max_output_tokens"])
+            request_body = build_classification_request(packet, settings["model"], settings["max_output_tokens"], plan["prompt_version"])
             _, receipt = inspect_classification_receipts(output_directory, request_body, packet)
             if receipt["status"] == "complete":
                 skipped_requests += 1
@@ -241,7 +264,7 @@ def run_prepared_classifications(arguments: argparse.Namespace) -> int:
     interrupted = False
     with lock_batch_directory(output_directory):
         # Recheck settings and receipts after locking: another runner may have finished.
-        settings = select_classification_settings(output_directory, arguments.model, arguments.max_output_tokens)
+        settings = select_classification_settings(output_directory, arguments.model, arguments.max_output_tokens, plan["prompt_version"])
         save_evidence_json(output_directory / "settings.json", settings)
         write_evidence_reports(output_directory, plan, settings)
         try:
@@ -253,7 +276,7 @@ def run_prepared_classifications(arguments: argparse.Namespace) -> int:
                 request_directory.mkdir(parents=True, exist_ok=True)
                 receipt_path = request_directory / f"attempt-{len(attempts) + 1:06d}.json"
                 receipt = {
-                    "request_id": request_id, "prompt_version": PROMPT_VERSION,
+                    "request_id": request_id, "prompt_version": plan["prompt_version"],
                     "request": request_body, "status": "running",
                     "started_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -316,9 +339,9 @@ def main(argument_values: list[str] | None = None) -> int:
     prepare.add_argument("--offline", action="store_true", help="use saved matching lines without fetching code context")
     prepare.add_argument("--context-lines", type=int, default=10, help="lines before/after each match (default: 10)")
     prepare.add_argument("--packet-bytes", type=int, default=24000, help="maximum UTF-8 JSON bytes per evidence packet (default: 24000)")
-    repack = commands.add_parser("repack", help="repackage saved v1/v2 evidence without network or model calls")
+    repack = commands.add_parser("repack", help="repackage saved evidence with current instructions without network or model calls")
     repack.add_argument("source", type=Path, help="existing prepared evidence directory")
-    repack.add_argument("--output", required=True, type=Path, help="new v2 evidence directory")
+    repack.add_argument("--output", required=True, type=Path, help="new evidence directory")
     repack.add_argument("--packet-bytes", type=int, default=24000, help="maximum UTF-8 JSON bytes per evidence packet (default: 24000)")
     run = commands.add_parser("run", help="classify or resume a prepared evidence directory")
     run.add_argument("output", type=Path)

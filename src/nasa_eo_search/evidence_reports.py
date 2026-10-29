@@ -10,7 +10,10 @@ from urllib.parse import quote
 from nasa_eo_search.batch_files import atomic_batch_output
 from nasa_eo_search.batch_reports import write_protected_csv_rows
 from nasa_eo_search.evidence_inputs import identify_evidence, read_evidence_json, serialize_evidence
-from nasa_eo_search.evidence_model import PROMPT_VERSION, build_classification_request, parse_classification_response
+from nasa_eo_search.evidence_model import (
+    CLASSIFICATION_PROMPTS, build_classification_request, parse_classification_response,
+    select_classification_prompt,
+)
 from nasa_eo_search.pipeline_tables import FILE_MATCH_COLUMNS
 
 
@@ -49,7 +52,7 @@ def load_evidence_plan(output_directory: Path) -> dict[str, Any]:
         output_directory: Directory created by the prepare subcommand.
 
     Returns:
-        Validated plan data with intact content hash and current prompt version.
+        Validated plan data with intact content hash and its original prompt version.
 
     Raises:
         OSError: If the plan is unavailable.
@@ -58,8 +61,10 @@ def load_evidence_plan(output_directory: Path) -> dict[str, Any]:
     envelope = read_evidence_json(output_directory / "plan.json")
     plan = envelope.get("data")
     schema_version = envelope.get("schema_version")
-    if type(schema_version) is not int or schema_version not in (2, 3) or (isinstance(plan, dict) and plan.get("prompt_version") != PROMPT_VERSION):
-        raise ValueError("This run needs evidence format 2 or file format 3 and repository-product-v2. Existing results are unchanged; "
+    if (type(schema_version) is not int or schema_version not in (2, 3)
+            or (isinstance(plan, dict) and (not isinstance(plan.get("prompt_version"), str)
+                or plan["prompt_version"] not in CLASSIFICATION_PROMPTS))):
+        raise ValueError("This run needs evidence format 2 or file format 3 and repository-product-v2 or repository-product-v3. Existing results are unchanged; "
                          "use nasa-evidence-classify repack SOURCE --output NEW, or prepare a new directory.")
     if (not isinstance(plan, dict) or envelope.get("plan_id") != identify_evidence(plan)
             or not isinstance(plan.get("groups"), list)):
@@ -451,6 +456,10 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
         OSError: If receipts cannot be read or reports cannot be written.
         ValueError: If saved receipts have inconsistent identities.
     """
+    prompt_version = plan["prompt_version"]
+    select_classification_prompt(prompt_version)
+    if settings is not None and settings.get("prompt_version", prompt_version) != prompt_version:
+        raise ValueError("Saved model settings and evidence plan have different prompt versions.")
     rows = []
     audit_groups = []
     request_states = []
@@ -467,7 +476,7 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
                 states.append("pending")
                 packet_audits.append({"packet_number": packet_number, "status": "pending"})
                 continue
-            request_body = build_classification_request(packet, settings["model"], settings["max_output_tokens"])
+            request_body = build_classification_request(packet, settings["model"], settings["max_output_tokens"], prompt_version)
             attempts, receipt = inspect_classification_receipts(output_directory, request_body, packet)
             states.append(receipt["status"])
             packet_audit = {
@@ -522,7 +531,7 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
             "packet_count": len(group["packets"]), "completed_packets": len(classifications),
             "search_complete": str(group["search_complete"]).lower(), "warnings": "\n".join(group["warnings"]),
             "error": "\n".join(sorted(set(errors))), "model": settings["model"] if settings else "",
-            "prompt_version": PROMPT_VERSION, "group_id": group["group_id"],
+            "prompt_version": prompt_version, "group_id": group["group_id"],
         }
         rows.append(row)
         audit_groups.append({
@@ -567,7 +576,7 @@ def write_evidence_reports(output_directory: Path, plan: dict[str, Any], setting
     save_evidence_json(output_directory / "audit.json", {
         "schema_version": 3 if is_file_plan else 2,
         "assessment_unit": "file" if is_file_plan else "repository_product",
-        "prompt_version": PROMPT_VERSION, "model": settings["model"] if settings else None,
+        "prompt_version": prompt_version, "model": settings["model"] if settings else None,
         "summary_method": "Strongest-supported packet conclusion; all packet judgments and citations retained below.",
         "search_scope": plan["search_scope"], "groups": audit_groups,
     })
