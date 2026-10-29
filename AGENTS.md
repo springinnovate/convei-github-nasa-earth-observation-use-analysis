@@ -17,13 +17,24 @@
 
 ## User documentation
 
+- Write repository documentation for people using or maintaining the software.
+  It must make sense without this conversation or knowledge of the development
+  history. Use plain language and explain technical terms when readers need them.
 - Write the README for someone installing and running the current commands.
   Include working examples, output files, options, and status interpretation.
+- Keep the README as the primary usage guide. Add a separate guide only when it
+  serves a clear, lasting task for a human reader that the README does not cover.
 - Use direct descriptions of current behavior. Omit development plans, future
   features, repeated research goals, and comparisons with things the software
   does not do.
 - Explain search scope and completion statuses where users need them to
   interpret their results. Keep wording concrete and concise.
+- Do not create or commit documentation that records agent work, plans, progress
+  updates, intermediate results, pilot reports, or generated comparison tables.
+  Do not create a document merely to record that a task was completed.
+- Put development decisions and validation summaries in the relevant GitHub
+  issue or PR description. Keep generated run data and reports in ignored output
+  directories, not in the documentation tree.
 
 ## Git branches
 
