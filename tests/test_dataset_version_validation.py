@@ -83,6 +83,39 @@ class DatasetVersionValidationTests(unittest.TestCase):
             with self.subTest(version=version, source_text=source_text):
                 self.assertFalse(version_occurs_with_product(version, source_text, "MOD13Q1"))
 
+    def test_modis_catalog_filenames_expose_version_before_exact_product(self) -> None:
+        """Accept recognized source filenames without borrowing the catalog entry's version."""
+        for version in ("006", "061"):
+            for extension in ("libsonnet", "jsonnet", "json", "js"):
+                source_text = f"local template = import 'templates/MODIS_{version}_MOD13Q1.{extension}';"
+                with self.subTest(version=version, extension=extension):
+                    self.assertTrue(version_occurs_with_product(version, source_text, "MOD13Q1"))
+        self.assertTrue(version_occurs_with_product("006", "templates/modis_006_mod13q1.libsonnet", "MOD13Q1"))
+
+    def test_modis_catalog_filename_versions_reject_extended_or_unrelated_names(self) -> None:
+        """Keep filename versions separate from sibling products and arbitrary suffixes."""
+        rejected_sources = (
+            "templates/MODIS_0061_MOD13Q1.libsonnet",
+            "templates/MODIS_061_MOD13Q1.libsonnet",
+            "templates/MODIS_006_MYD13Q1.libsonnet",
+            "templates/MODIS_006_MOD13Q10.libsonnet",
+            "templates/MODIS_006_MOD13Q1_E.libsonnet",
+            "templates/MODIS_006_MOD13Q1-derived.libsonnet",
+            "templates/MODIS_006_MOD13Q1.extra.libsonnet",
+            "templates/MODIS_006_MOD13Q1.libsonnet.backup",
+            "templates/MODIS_006_MOD13Q1.libsonnet-derived",
+            "templates/MODIS_006_MOD13Q1.arbitrary",
+            "templates/otherMODIS_006_MOD13Q1.libsonnet",
+            "templates/other_MODIS_006_MOD13Q1.libsonnet",
+            "templates/006_MOD13Q1.libsonnet",
+            "templates/MODIS/006_MOD13Q1.libsonnet",
+            "templates/MODIS_006/MOD13Q1.libsonnet",
+            "templates/MODIS_006_OTHER.libsonnet; product = 'MOD13Q1'",
+        )
+        for source_text in rejected_sources:
+            with self.subTest(source_text=source_text):
+                self.assertFalse(version_occurs_with_product("006", source_text, "MOD13Q1"))
+
     def test_cited_old_collection_is_accepted_despite_newer_catalog_metadata(self) -> None:
         """Validate an observed 006 path while the saved catalog describes 061."""
         packet = create_modis_version_plan()["groups"][0]["packets"][0]
@@ -244,6 +277,43 @@ class DatasetVersionValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not explicitly associated"):
             validate_classification(judgment, packet)
 
+    def test_virtual_store_urls_retain_only_the_explicit_source_product_version(self) -> None:
+        """Observe the product's terminal version separately from virtual-store revisions."""
+        product_name = "MUR-JPL-L4-GLOB-v4.1"
+        for version in ("4.1", "v4.1", "V4.1"):
+            for source_text in (
+                f'store_url = "s3://nasa-eodc-public/icechunk/{product_name}-virtual-v2-p2"',
+                f"gs://example/{product_name}-virtual-v12/metadata.json",
+                f"https://example.org/stores/{product_name}-virtual-v2-p2?key=value",
+            ):
+                with self.subTest(version=version, source_text=source_text):
+                    self.assertTrue(version_occurs_with_product(version, source_text, product_name))
+        self.assertTrue(version_occurs_with_product(
+            "v12.3", "s3://example/TEST-DATA-v12.3-virtual-v2-p2", "TEST-DATA-v12.3"))
+
+    def test_virtual_store_versions_reject_sibling_products_and_representation_versions(self) -> None:
+        """Reject non-source revisions and names that merely contain the target product."""
+        product_name = "MUR-JPL-L4-GLOB-v4.1"
+        source_text = f"s3://example/stores/{product_name}-virtual-v2-p2"
+        for version in ("2", "v2", "p2", "4", "v4", "4.10", "04.1"):
+            with self.subTest(version=version):
+                self.assertFalse(version_occurs_with_product(version, source_text, product_name))
+        for source_text in (
+            f"{product_name}-virtual-v2-p2",
+            f"s3://example/{product_name}_E-virtual-v2-p2",
+            f"s3://example/{product_name}-derived",
+            f"s3://example/{product_name}-derived-virtual-v2-p2",
+            f"s3://example/{product_name}-virtual-v2-p2-derived",
+            f"s3://example/{product_name}-virtual-v2_E",
+            f"s3://example/{product_name}-virtual-v2.p2",
+            f"s3://example/{product_name}.extra-virtual-v2-p2",
+            f"s3://example/OTHER_{product_name}-virtual-v2-p2",
+            "s3://example/MUR-JPL-L4-GLOB-v4.10-virtual-v2-p2",
+            "s3://example/OTHER-L4-GLOB-v4.1-virtual-v2-p2",
+        ):
+            with self.subTest(source_text=source_text):
+                self.assertFalse(version_occurs_with_product("v4.1", source_text, product_name))
+
     def test_catalog_only_version_is_not_a_source_observation(self) -> None:
         """Reject catalog versions and mapping values absent from the cited code."""
         packet = create_modis_version_plan()["groups"][0]["packets"][0]
@@ -390,25 +460,35 @@ class DatasetVersionValidationTests(unittest.TestCase):
     def test_failed_version_validation_reuses_durable_response_without_new_call(self) -> None:
         """Recover rejected paths, titles and paired constants without another call."""
         source_cases = (
-            ("006", 'collection = ee.ImageCollection("MODIS/006/MOD13Q1")'),
-            ("6.1", "MODIS Vegetation Indices (MOD13Q1) Version 6.1"),
-            ("07", 'MODIS_PRODUCT_DAILY: str = "MOD13Q1"\nMODIS_VERSION: str = "07"'),
+            ("MOD13Q1", "006", 'collection = ee.ImageCollection("MODIS/006/MOD13Q1")'),
+            ("MOD13Q1", "6.1", "MODIS Vegetation Indices (MOD13Q1) Version 6.1"),
+            ("MOD13Q1", "07", 'MODIS_PRODUCT_DAILY: str = "MOD13Q1"\nMODIS_VERSION: str = "07"'),
+            ("MOD13Q1", "006", "local template = import 'templates/MODIS_006_MOD13Q1.libsonnet';"),
+            ("MUR-JPL-L4-GLOB-v4.1", "v4.1",
+             'store_url = "s3://nasa-eodc-public/icechunk/MUR-JPL-L4-GLOB-v4.1-virtual-v2-p2"'),
         )
-        for observed_version, source_text in source_cases:
+        for product_name, observed_version, source_text in source_cases:
             with self.subTest(source_text=source_text), TemporaryDirectory() as temporary_directory:
-                self.assert_cached_version_response_recovers(Path(temporary_directory), observed_version, source_text)
+                self.assert_cached_version_response_recovers(
+                    Path(temporary_directory), observed_version, source_text, product_name)
 
-    def assert_cached_version_response_recovers(self, temporary_directory: Path, observed_version: str, source_text: str) -> None:
+    def assert_cached_version_response_recovers(
+        self, temporary_directory: Path, observed_version: str, source_text: str, product_name: str,
+    ) -> None:
         """Verify a rejected response is revalidated locally and retained unchanged.
 
         Args:
             temporary_directory: Test-owned root for the classification run.
             observed_version: Exact version stored in the old failed response.
             source_text: Cited product/version evidence supplied to that response.
+            product_name: Exact product whose observed version is being validated.
         """
         with redirect_stderr(StringIO()):
             output_directory = Path(temporary_directory) / "classification"
             plan = create_modis_version_plan(source_text)
+            group = plan["groups"][0]
+            group["product"]["short_name"] = product_name
+            group["group_id"] = identify_evidence([group["repository"], "LPCLOUD", product_name])
             with redirect_stderr(StringIO()):
                 save_prepared_classification_plan(output_directory, plan)
             packet = plan["groups"][0]["packets"][0]

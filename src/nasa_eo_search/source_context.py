@@ -5,6 +5,8 @@ import json
 from pathlib import PurePosixPath
 import re
 
+from nasa_eo_search.document_context import select_document_context_lines
+
 
 MAX_SOURCE_BYTES = 2_000_000
 MAX_SOURCE_LINES = 50_000
@@ -33,7 +35,8 @@ def select_enclosing_source_lines(
     their own character budget without losing distant definition headers.
     Small scripts can include their complete source within the added-context
     character budget. Python containing definitions retains selective structural
-    context. Unsupported, malformed, or oversized source receives an explicit
+    context. Markdown preserves enclosing headings and bounded purpose prose.
+    Unsupported, malformed, or oversized source receives an explicit
     fallback, with a bounded file-purpose header when available.
 
     Args:
@@ -59,6 +62,13 @@ def select_enclosing_source_lines(
     if len(source_text.encode("utf-8", errors="replace")) > MAX_SOURCE_BYTES:
         return _select_nearby_fallback(source_lines, matches, "Source exceeds the structural parsing byte limit.")
     extension = PurePosixPath(file_path.replace("\\", "/")).suffix.lower()
+    if extension in {".md", ".markdown", ".rmd"}:
+        document_selection = select_document_context_lines(source_lines, matches[:MAX_STRUCTURAL_MATCHES])
+        result["notes"].extend(document_selection["notes"])
+        if len(matches) > MAX_STRUCTURAL_MATCHES:
+            result["notes"].append(f"Document context examines the first {MAX_STRUCTURAL_MATCHES} matching lines.")
+        _append_source_lines(result, document_selection["line_numbers"], len(source_lines))
+        return result
     if extension not in {".py", ".pyi", ".yaml", ".yml", ".json"}:
         fallback = _select_nearby_fallback(source_lines, matches, f"Structural context is unsupported for {extension or 'this file type'}.")
         _add_script_file_context(source_lines, extension, fallback)
