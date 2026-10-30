@@ -149,6 +149,16 @@ The key lookup uses `OPENAI_API_KEY`, then `./secrets/openai.key`; an explicit
 `--api-key-file PATH` takes precedence. Keys and key-file paths are not saved in
 the search plan. Dry runs and resumes with no new web work do not read a key.
 
+For example, preview a small web-assisted search of an existing catalog:
+
+```console
+nasa-eo search nasa-catalog --short-name ATL03 --web-search-model YOUR_MODEL --api-key-file ./secrets/openai.key --github-pages 1 --max-repositories 3 --max-archive-mb 25 --max-total-mb 75 --max-requests 3 --output web-search-sample --dry-run
+```
+
+Replace `YOUR_MODEL` with your model name and remove `--dry-run` to run it. This
+allows one paid web request, two GitHub discovery requests, and at most three
+repository downloads. Results are written to `web-search-sample/matches.csv`.
+
 For each selected dataset, the command prepares an exact short-name query and,
 when the catalog has a useful title, a second query adding up to six title words.
 Both target `github.com`. The plan records the title, catalog provenance, model,
